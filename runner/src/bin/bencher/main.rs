@@ -23,13 +23,8 @@ struct Stats {
     /// Number of client stats merged into this struct.
     merged: usize,
     // Performance statistics:
-    total_ms: f64,                   // in millisecs
-    tput_all: f64,                   // in ops/sec
-    num_ops: HashMap<String, usize>, // map from op type -> count
-    lat_avg: HashMap<String, f64>,   // map from op type -> microsecs
-    lat_min: HashMap<String, f64>,
-    lat_max: HashMap<String, f64>,
-    lat_p99: HashMap<String, f64>,
+    total_ms: f64,                          // in millisecs
+    lat_samples: HashMap<String, Vec<f64>>, // map from op type -> microsecs
 }
 
 impl Stats {
@@ -37,13 +32,37 @@ impl Stats {
         Stats {
             merged: 0,
             total_ms: 0.0,
-            tput_all: 0.0,
-            num_ops: HashMap::new(),
-            lat_avg: HashMap::new(),
-            lat_min: HashMap::new(),
-            lat_max: HashMap::new(),
-            lat_p99: HashMap::new(),
+            lat_samples: HashMap::new(),
         }
+    }
+
+    fn record_op(&mut self, op: &str, latency_us: f64) {
+        self.lat_samples
+            .entry(op.to_string())
+            .or_default()
+            .push(latency_us);
+    }
+
+    fn total_ops(&self) -> usize {
+        self.lat_samples.values().map(|s| s.len()).sum()
+    }
+
+    fn latency_stats(samples: &[f64]) -> Option<(f64, f64, f64, f64)> {
+        if samples.is_empty() {
+            return None;
+        }
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let len = sorted.len();
+        let sum: f64 = sorted.iter().sum();
+        let avg = sum / len as f64;
+        let min = sorted[0];
+        let max = sorted[len - 1];
+        let idx = ((len as f64) * 0.99).ceil() as usize;
+        let idx = idx.saturating_sub(1).min(len - 1);
+        let p99 = sorted[idx];
+        Some((avg, min, max, p99))
     }
 
     fn print(&self, phase: &str) {
@@ -52,12 +71,19 @@ impl Stats {
             format!("[{}]", phase),
             self.total_ms
         );
-        println!("    Throughput:  {:9.2} ops/sec", self.tput_all);
+        let total_ops = self.total_ops();
+        let tput_all = if self.total_ms > 0.0 {
+            total_ops as f64 / (self.total_ms / 1000.0)
+        } else {
+            0.0
+        };
+        println!("    Throughput:  {:9.2} ops/sec", tput_all);
 
-        for (i, op) in self.lat_avg.keys().enumerate() {
-            debug_assert!(self.lat_min.contains_key(op));
-            debug_assert!(self.lat_max.contains_key(op));
-            debug_assert!(self.lat_p99.contains_key(op));
+        let mut ops: Vec<_> = self.lat_samples.keys().cloned().collect();
+        ops.sort();
+        for (i, op) in ops.iter().enumerate() {
+            let samples = &self.lat_samples[op];
+            let (avg, min, max, p99) = Self::latency_stats(samples).unwrap_or((0.0, 0.0, 0.0, 0.0));
             if i == 0 {
                 print!("    Latency:");
             } else {
@@ -66,11 +92,11 @@ impl Stats {
             println!(
                 "    {:6}  ops {:6}  avg {:9.2}  min {:6.0}  max {:6.0}  p99 {:6.0}  us",
                 op,
-                self.num_ops[op],
-                self.lat_avg[op],
-                self.lat_min[op],
-                self.lat_max[op],
-                self.lat_p99[op]
+                samples.len(),
+                avg,
+                min,
+                max,
+                p99
             );
         }
     }
@@ -84,39 +110,10 @@ impl Stats {
         } else {
             // take longer total run time
             self.total_ms = f64::max(self.total_ms, other.total_ms);
-            // take sum of throughput
-            self.tput_all += other.tput_all;
-            // take sum of operations count
-            Self::merge_map(&mut self.num_ops, other.num_ops, |sc, oc| sc + oc);
-            // take overall average of avg latency
-            Self::merge_map(&mut self.lat_avg, other.lat_avg, |sl, ol| {
-                (sl * self.merged as f64 + ol * other.merged as f64)
-                    / (self.merged + other.merged) as f64
-            });
-            // take min/max of min/max latency
-            Self::merge_map(&mut self.lat_min, other.lat_min, f64::min);
-            Self::merge_map(&mut self.lat_max, other.lat_max, f64::max);
-            // for P99 latency, take the max, which should be reasonable
-            Self::merge_map(&mut self.lat_p99, other.lat_p99, f64::max);
-        }
-    }
-
-    /// Internal helper for the merge of op count or latency values.
-    fn merge_map<T, F>(
-        self_lat: &mut HashMap<String, T>,
-        other_lat: HashMap<String, T>,
-        merge_fn: F,
-    ) where
-        T: Copy,
-        F: Fn(T, T) -> T,
-    {
-        for (op, self_lat) in &mut *self_lat {
-            if let Some(other_lat) = other_lat.get(op) {
-                *self_lat = merge_fn(*self_lat, *other_lat);
+            for (op, samples) in other.lat_samples {
+                self.lat_samples.entry(op).or_default().extend(samples);
             }
-        }
-        for (op, other_lat) in other_lat {
-            self_lat.entry(op).or_insert(other_lat);
+            self.merged += other.merged;
         }
     }
 }

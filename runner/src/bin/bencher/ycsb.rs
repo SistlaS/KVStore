@@ -10,7 +10,7 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::str::SplitWhitespace;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use runner::{ClientProc, KvCall, RunnerError};
 
@@ -129,39 +129,30 @@ impl YcsbDriver {
         Ok(scnt)
     }
 
-    /// Parse a floating point number from YCSB performance reporting line.
-    fn parse_ycsb_float(segs: &mut SplitWhitespace) -> Result<f64, RunnerError> {
-        let num = segs
-            .next()
-            .ok_or(RunnerError::Parse("missing float number".into()))?
-            .parse::<f64>()?;
-        Ok(num)
-    }
-
     /// Parse a YCSB driver output line into a KV operation call, or `None` if
     /// not a call line.
     fn interpret_ycsb_call(
         line: &str,
         ikeys: &mut BTreeSet<String>,
-    ) -> Result<Option<KvCall>, RunnerError> {
+    ) -> Result<Option<(KvCall, String)>, RunnerError> {
         let mut segs = line.split_whitespace();
         match segs.next() {
             Some("INSERT") => {
                 let key = Self::parse_ycsb_key(&mut segs)?;
                 let value = Self::parse_ycsb_value(&mut segs)?;
                 ikeys.insert(key.clone());
-                Ok(Some(KvCall::Put { key, value }))
+                Ok(Some((KvCall::Put { key, value }, "INSERT".into())))
             }
 
             Some("UPDATE") => {
                 let key = Self::parse_ycsb_key(&mut segs)?;
                 let value = Self::parse_ycsb_value(&mut segs)?;
-                Ok(Some(KvCall::Swap { key, value }))
+                Ok(Some((KvCall::Swap { key, value }, "UPDATE".into())))
             }
 
             Some("READ") => {
                 let key = Self::parse_ycsb_key(&mut segs)?;
-                Ok(Some(KvCall::Get { key }))
+                Ok(Some((KvCall::Get { key }, "READ".into())))
             }
 
             Some("SCAN") => {
@@ -176,52 +167,12 @@ impl YcsbDriver {
                         .unwrap_or(ikeys.last().unwrap())
                         .clone()
                 };
-                Ok(Some(KvCall::Scan { key_start, key_end }))
+                Ok(Some((KvCall::Scan { key_start, key_end }, "SCAN".into())))
             }
 
             // no Deletes in default YCSB
             _ => Ok(None),
         }
-    }
-
-    /// Parse a YCSB driver performance reporting line and record in the
-    /// given `stats`.
-    fn record_ycsb_perf(line: &str, stats: &mut Stats) -> Result<(), RunnerError> {
-        let mut segs = line.split_whitespace();
-        let header = segs.next();
-        match header {
-            Some("[OVERALL],") => {
-                if let Some(name) = segs.next() {
-                    if name.contains("RunTime(ms)") {
-                        stats.total_ms = Self::parse_ycsb_float(&mut segs)?;
-                    } else if name.contains("Throughput") {
-                        stats.tput_all = Self::parse_ycsb_float(&mut segs)?;
-                    }
-                }
-            }
-
-            Some("[INSERT],") | Some("[UPDATE],") | Some("[READ],") | Some("[SCAN],") => {
-                let op = header.unwrap()[1..(header.unwrap().len() - 2)].to_string();
-                if let Some(name) = segs.next() {
-                    if name.contains("Operations") {
-                        stats
-                            .num_ops
-                            .insert(op, Self::parse_ycsb_float(&mut segs)? as usize);
-                    } else if name.contains("AverageLatency") {
-                        stats.lat_avg.insert(op, Self::parse_ycsb_float(&mut segs)?);
-                    } else if name.contains("MinLatency") {
-                        stats.lat_min.insert(op, Self::parse_ycsb_float(&mut segs)?);
-                    } else if name.contains("MaxLatency") {
-                        stats.lat_max.insert(op, Self::parse_ycsb_float(&mut segs)?);
-                    } else if name.contains("99thPercentileLatency") {
-                        stats.lat_p99.insert(op, Self::parse_ycsb_float(&mut segs)?);
-                    }
-                }
-            }
-
-            _ => {}
-        }
-        Ok(())
     }
 
     /// Feed a line of YCSB basic driver output to the KV client. For the last
@@ -234,6 +185,8 @@ impl YcsbDriver {
         ikeys: &mut BTreeSet<String>,
         stats: &mut Stats,
         ended: &mut bool,
+        started: &mut Option<Instant>,
+        last_end: &mut Option<Instant>,
     ) -> Result<(), RunnerError> {
         line.clear();
 
@@ -248,14 +201,21 @@ impl YcsbDriver {
             return Ok(());
         }
 
-        if let Some(call) = Self::interpret_ycsb_call(line, ikeys)? {
+        if let Some((call, op)) = Self::interpret_ycsb_call(line, ikeys)? {
             // is an operation call, do it synchronously
             // RESP_TIMEOUT should be long enough to prevent false negatives
+            let start = Instant::now();
             client.send_call(call)?;
             let _ = client.wait_resp(RESP_TIMEOUT)?;
+            let elapsed = start.elapsed();
+
+            if started.is_none() {
+                *started = Some(start);
+            }
+            *last_end = Some(Instant::now());
+            stats.record_op(&op, elapsed.as_micros() as f64);
         } else if line.starts_with('[') {
-            // might be a performance reporting line, record the number
-            Self::record_ycsb_perf(line, stats)?;
+            // performance reporting line from YCSB, ignored
         } else if line.contains("No such file") {
             // probably not finding the workload profile file
             return Err(RunnerError::Io(line.clone()));
@@ -274,6 +234,8 @@ impl YcsbDriver {
     ) -> Option<(Stats, BTreeSet<String>)> {
         let mut stats = Stats::new();
         let mut ended = false;
+        let mut started: Option<Instant> = None;
+        let mut last_end: Option<Instant> = None;
 
         READBUF.with(|buf| {
             let line = &mut buf.borrow_mut();
@@ -287,6 +249,8 @@ impl YcsbDriver {
                     &mut ikeys,
                     &mut stats,
                     &mut ended,
+                    &mut started,
+                    &mut last_end,
                 ) {
                     if !matches!(err, RunnerError::Chan(_)) {
                         eprintln!("Error in feeder: {}", err);
@@ -310,6 +274,9 @@ impl YcsbDriver {
             None
         } else {
             // ended successfully
+            if let (Some(start), Some(end)) = (started, last_end) {
+                stats.total_ms = (end - start).as_secs_f64() * 1000.0;
+            }
             stats.merged = 1;
             Some((stats, ikeys))
         }
