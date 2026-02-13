@@ -421,7 +421,7 @@ STOP  # confirm STOP before exit
 
 </details>
 
-Assume all keys and values are ASCII alphanumeric, case-sensitive strings. All keywords are also case-sensitive. All spaces are regular spaces and the number of them does not matter.
+Assume all keys and values are ASCII, case-sensitive strings without spaces. All keywords are also case-sensitive. All spaces are regular spaces and the number of them does not matter.
 
 ---
 
