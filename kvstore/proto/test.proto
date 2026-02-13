@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "madkv/kvstore/gen/kvpb;kvpb";
+
+service KV {
+  rpc Ping(PingRequest) returns (PingReply);
+}
+
+message PingRequest {
+  string msg = 1;
+}
+
+message PingReply {
+  string msg = 1;
+}
