@@ -123,6 +123,7 @@ test2 server="127.0.0.1:50051":
         "DELETE $ky" \
         "SCAN $kz $kz" \
         "DELETE $kx" \
+        "PÜT $kx 1" \
         "PUT k" \
         "GET" \
         "SCAN" \
@@ -136,6 +137,7 @@ test2 server="127.0.0.1:50051":
     assert "SCAN $kz $kz BEGIN"
     assert "SCAN END"
     assert "DELETE $kx found"
+    assert "unknown command: PÜT"
     assert "PUT requires 2 arguments: key value"
     assert "GET requires 1 argument: key"
     assert "SCAN requires 2 arguments: start_key end_key"
