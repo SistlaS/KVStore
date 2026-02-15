@@ -257,6 +257,9 @@ func stdinMode(c kvpb.KVSClient, timeout time.Duration) {
 				cancel()
 				continue
 			}
+			// Echo STOP so the runner's driver can observe the client's stop
+			// response and avoid timing out waiting on the response channel.
+			fmt.Println("STOP")
 			cancel()
 			return
 
