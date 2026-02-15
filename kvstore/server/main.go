@@ -55,13 +55,12 @@ func (s *kvServer) Swap(ctx context.Context, req *kvpb.SwapRequest) (*kvpb.SwapR
 	defer s.mu.Unlock()
 
 	got := s.tree.Get(item{key: req.Key})
+	_ = s.tree.ReplaceOrInsert(item{key: req.Key, value: req.Value})
+	
 	if got == nil {
-		// Must NOT insert if missing; return null/Found=false.
 		return &kvpb.SwapReply{Found: false}, nil
 	}
-	old := got.(item).value
-	_ = s.tree.ReplaceOrInsert(item{key: req.Key, value: req.Value})
-	return &kvpb.SwapReply{Found: true, OldValue: old}, nil
+	return &kvpb.SwapReply{Found: true, OldValue: got.(item).value}, nil
 }
 
 func (s *kvServer) Delete(ctx context.Context, req *kvpb.DeleteRequest) (*kvpb.DeleteReply, error) {
