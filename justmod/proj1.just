@@ -133,7 +133,7 @@ test2 server="127.0.0.1:50051":
     assert "PUT $kx not_found"
     assert "GET $ky null"
     assert "SWAP $ky null"
-    assert "DELETE $ky not_found"
+    assert "DELETE $ky found"
     assert "SCAN $kz $kz BEGIN"
     assert "SCAN END"
     assert "DELETE $kx found"
