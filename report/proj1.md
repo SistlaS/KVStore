@@ -1,6 +1,6 @@
 # CS 739 MadKV Project 1
 
-**Group members**: Name `email`, Name `email`
+**Group members**: Amith Bhat Nekkare `bhatnekkare@wisc.edu`, Soumya Sistla `ssistla@wisc.edu`
 
 ## Design Walkthrough
 
@@ -37,17 +37,35 @@ testcase | outcome
 
 ### Explanations
 
-Test1 (single client, basic flow): Exercises `PUT/GET/SWAP/SCAN/DELETE` in a simple, linear sequence. The output confirms that `PUT` returns `not_found` on first insert, `SWAP` returns the old value, `SCAN` prints both keys in range, and the deleted key reads back as `null`. Coverage: happy-path correctness for all core operations and scan formatting.
+Test1 (single client, basic flow): 
 
-Test2 (single client, edge/error cases): Mixes missing-key operations, an empty-range `SCAN`, and malformed commands (`PÜT`, missing args, extra args) to verify the client emits protocol-compliant error messages. The output should show `null`/`not_found` for missing keys and specific error lines for invalid inputs. Coverage: input validation, error handling, and protocol robustness.
+Exercises `PUT/GET/SWAP/SCAN/DELETE` in a simple, linear sequence. The output confirms that `PUT` returns `not_found` on first insert, `SWAP` returns the old value, `SCAN` prints both keys in range, and the deleted key reads back as `null`. 
+Coverage: happy-path correctness for all core operations and scan formatting.
 
-Test3 (two clients, disjoint keys): Runs two clients concurrently on different keys with full CRUD and swap. The outputs show both clients see their own updates and deletes without interference. Coverage: concurrency without conflicts, per-key isolation, and correctness under parallel execution.
+Test2 (single client, edge/error cases): 
 
-Test4 (two clients, overlapping key): Interleaves two clients sharing one key and scanning ranges. Outputs validate that one client observes a non-null value for the shared key, `PUT` on existing key returns `found`, and scans use proper `BEGIN/END` markers. Coverage: correctness under contention and scan behavior with concurrent updates.
+Mixes missing-key operations, an empty-range `SCAN`, and malformed commands (`PÜT`, missing args, extra args) to verify the client emits protocol-compliant error messages. The output should show `null`/`not_found` for missing keys and specific error lines for invalid inputs. 
+Coverage: input validation, error handling, and protocol robustness.
 
-Test5 (three clients, higher contention): Three clients overlap on a shared key with staggered starts and deletes. Outputs show `SWAP` returns the expected old value, deletes take effect, and later `GET` returns `null`. Coverage: multi-client interleavings, visibility of updates/deletes, and ordering under higher concurrency.
+Test3 (two clients, disjoint keys): 
 
-Coverage discussion: Together, the self-written tests cover all five operations (`PUT/GET/SWAP/DELETE/SCAN`), both success and missing-key cases, and a range of concurrency patterns (single client, disjoint keys, shared keys, and three-way contention). They also validate the stdin/stdout protocol’s error handling (invalid keywords and argument counts). Gaps remain around large scans, long-running stress, and performance under high client counts; these would require extended or randomized workloads beyond the current deterministic tests.
+Runs two clients concurrently on different keys with full CRUD and swap. The outputs show both clients see their own updates and deletes without interference. 
+Coverage: concurrency without conflicts, per-key isolation, and correctness under parallel execution.
+
+Test4 (two clients, overlapping key): 
+
+Interleaves two clients sharing one key and scanning ranges. Outputs validate that one client observes a non-null value for the shared key, `PUT` on existing key returns `found`, and scans use proper `BEGIN/END` markers. 
+Coverage: correctness under contention and scan behavior with concurrent updates.
+
+Test5 (three clients, higher contention): 
+
+Three clients overlap on a shared key with staggered starts and deletes. Outputs show `SWAP` returns the expected old value, deletes take effect, and later `GET` returns `null`. 
+Coverage: multi-client interleavings, visibility of updates/deletes, and ordering under higher concurrency.
+
+Additional discussion: 
+
+Together, the self-written tests cover all five operations (`PUT/GET/SWAP/DELETE/SCAN`), both success and missing-key cases, and a range of concurrency patterns (single client, disjoint keys, shared keys, and three-way contention). They also validate the stdin/stdout protocol’s error handling (invalid keywords and argument counts). Gaps remain around large scans, long-running stress, and performance under high client counts; these would require extended or randomized workloads beyond the current deterministic tests.
+
 All results are asserted against expected outputs in the test scripts to ensure correctness.
 
 ## Fuzz Testing
@@ -64,9 +82,15 @@ You will run a multi-client conflicting-keys fuzz test during demo time.
 
 ### Comments
 
-Fuzz testcases: I ran three configurations: 1 client without conflicts, 3 clients without conflicts, and 3 clients with conflicting keys. The logs indicate all runs completed successfully with no assertion failures or malformed responses.
+Fuzz testcases: 
 
-Outputs and coverage: The no-conflict runs exercise random mixes of operations without interference, which is good for validating basic correctness across a wider key space. The conflict run is the most valuable for coverage because it stresses concurrent updates, visibility, and the server’s ability to serialize operations while keeping the protocol outputs consistent. What it does not cover is long-duration stress, large scans, or high client counts; increasing runtime or clients would improve coverage of rare interleavings.
+
+We ran three configurations: 1 client without conflicts, 3 clients without conflicts, and 3 clients with conflicting keys. The logs indicate all runs completed successfully with no assertion failures or malformed responses.
+
+Outputs and coverage: 
+
+
+The no-conflict runs exercise random mixes of operations without interference, which is good for validating basic correctness across a wider key space. The conflict run is the most valuable for coverage because it stresses concurrent updates, visibility, and the server’s ability to serialize operations while keeping the protocol outputs consistent. What it does not cover is long-duration stress, large scans, or high client counts; increasing runtime or clients would improve coverage of rare interleavings.
 
 ## YCSB Benchmarking
 
