@@ -1,0 +1,14 @@
+PUT x_1771215518_9732 not_found
+GET y_1771215518_9732 null
+SWAP y_1771215518_9732 null
+DELETE y_1771215518_9732 found
+SCAN z_1771215518_9732 z_1771215518_9732 BEGIN
+SCAN END
+DELETE x_1771215518_9732 found
+2026/02/15 21:18:38 unknown command: PÜT
+2026/02/15 21:18:38 PUT requires 2 arguments: key value
+2026/02/15 21:18:38 GET requires 1 argument: key
+2026/02/15 21:18:38 SCAN requires 2 arguments: start_key end_key
+2026/02/15 21:18:38 STOP takes no arguments
+STOP
+all asserts passed in test2!
