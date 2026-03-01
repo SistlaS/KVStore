@@ -2,21 +2,22 @@ package main
 
 import (
 	"context"
-	"database/sql"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
 
+	kvpb "madkv/kvstore/gen/kvpb"
+
 	"github.com/google/btree"
 	"google.golang.org/grpc"
-	"google.golang.org/protobuf/proto"
-	kvpb "madkv/kvstore/gen/kvpb"
-	_ "modernc.org/sqlite"
 )
 
 type item struct {
@@ -28,104 +29,149 @@ func (a item) Less(b btree.Item) bool { return a.key < b.(item).key }
 
 type kvServer struct {
 	kvpb.UnimplementedKVSServer
-	mu   sync.Mutex
-	tree *btree.BTree
-	db   *sql.DB
+	mu      sync.Mutex
+	tree    *btree.BTree
+	logFile *os.File
 }
 
-const dbFileName = "commands.db"
+type walCommand struct {
+	Op    string `json:"op"`
+	Key   string `json:"key"`
+	Value string `json:"value,omitempty"`
+}
 
-func newKVServer(backerDir string) (*kvServer, error) {
-	if err := os.MkdirAll(backerDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create backer directory: %w", err)
+const maxWALFrameSize = 1 << 10 // 1 KB safety bound for one command record.
+
+func newKVServer(logPath string) (*kvServer, error) {
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		return nil, fmt.Errorf("create wal directory: %w", err)
 	}
-	dbPath := filepath.Join(backerDir, dbFileName)
-	db, err := sql.Open("sqlite", dbPath)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite db: %w", err)
+		return nil, fmt.Errorf("open wal: %w", err)
 	}
 
 	s := &kvServer{
-		tree: btree.New(8),
-		db:   db,
+		tree:    btree.New(8),
+		logFile: f,
 	}
-	if err := s.initDB(); err != nil {
-		_ = db.Close()
+	if err := s.replayWAL(); err != nil {
+		_ = f.Close()
 		return nil, err
 	}
-	if err := s.replayLog(); err != nil {
-		_ = db.Close()
-		return nil, err
+	if _, err := s.logFile.Seek(0, io.SeekEnd); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("seek wal end: %w", err)
 	}
 	return s, nil
 }
 
-func (s *kvServer) initDB() error {
-	if _, err := s.db.Exec(`
-		PRAGMA journal_mode = WAL;
-		PRAGMA synchronous = FULL;
-		CREATE TABLE IF NOT EXISTS wal_log (
-			seq INTEGER PRIMARY KEY AUTOINCREMENT,
-			payload BLOB NOT NULL
-		);
-	`); err != nil {
-		return fmt.Errorf("initialize sqlite schema: %w", err)
+func writeFull(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
 	}
 	return nil
 }
 
-func isValidOp(op kvpb.WALCommand_Op) bool {
-	return op == kvpb.WALCommand_OP_PUT ||
-		op == kvpb.WALCommand_OP_SWAP ||
-		op == kvpb.WALCommand_OP_DELETE
+func readFullWithEOFAsBoundary(r io.Reader, data []byte) error {
+	n, err := io.ReadFull(r, data)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		if n == 0 {
+			return io.EOF
+		}
+		return io.ErrUnexpectedEOF
+	}
+	return err
 }
 
-func (s *kvServer) replayLog() error {
-	rows, err := s.db.Query(`SELECT payload FROM wal_log ORDER BY seq ASC`)
-	if err != nil {
-		return fmt.Errorf("query wal log: %w", err)
-	}
-	defer rows.Close()
+func isValidOp(op string) bool {
+	return op == "put" || op == "swap" || op == "delete"
+}
 
-	for rows.Next() {
-		var payload []byte
-		if err := rows.Scan(&payload); err != nil {
-			return fmt.Errorf("scan wal row: %w", err)
+func (s *kvServer) replayWAL() error {
+	if _, err := s.logFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek wal start: %w", err)
+	}
+
+	lenBuf := make([]byte, 4)
+	for {
+		err := readFullWithEOFAsBoundary(s.logFile, lenBuf)
+		if errors.Is(err, io.EOF) {
+			return nil
 		}
-		var cmd kvpb.WALCommand
-		if err := proto.Unmarshal(payload, &cmd); err != nil {
-			return fmt.Errorf("decode wal payload: %w", err)
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			// Ignore a trailing partial frame (e.g., crash mid-write).
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read wal frame length: %w", err)
+		}
+
+		sz := binary.BigEndian.Uint32(lenBuf)
+		if sz > maxWALFrameSize {
+			return fmt.Errorf("wal frame too large: %d bytes", sz)
+		}
+		payload := make([]byte, sz)
+		err = readFullWithEOFAsBoundary(s.logFile, payload)
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			// Ignore a trailing partial frame (e.g., crash mid-write).
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read wal frame payload: %w", err)
+		}
+
+		var cmd walCommand
+		if err := json.Unmarshal(payload, &cmd); err != nil {
+			return fmt.Errorf("decode wal command: %w", err)
 		}
 		if !isValidOp(cmd.Op) {
 			return fmt.Errorf("unknown wal op: %q", cmd.Op)
 		}
-		s.applyCommand(&cmd)
+		s.applyCommand(cmd)
 	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate wal rows: %w", err)
-	}
-	return nil
 }
 
-func (s *kvServer) appendLog(cmd *kvpb.WALCommand) error {
+func (s *kvServer) appendWAL(cmd walCommand) error {
 	if !isValidOp(cmd.Op) {
 		return fmt.Errorf("unknown wal op: %q", cmd.Op)
 	}
-	payload, err := proto.Marshal(cmd)
+	payload, err := json.Marshal(cmd)
 	if err != nil {
-		return fmt.Errorf("encode wal payload: %w", err)
+		return fmt.Errorf("encode wal command: %w", err)
 	}
-	if _, err := s.db.Exec(`INSERT INTO wal_log(payload) VALUES(?)`, payload); err != nil {
-		return fmt.Errorf("append wal row: %w", err)
+	if len(payload) > maxWALFrameSize {
+		return fmt.Errorf("wal payload too large: %d bytes", len(payload))
+	}
+	frame := make([]byte, 4)
+	binary.BigEndian.PutUint32(frame, uint32(len(payload)))
+	if err := writeFull(s.logFile, frame); err != nil {
+		return fmt.Errorf("write wal frame length: %w", err)
+	}
+	if err := writeFull(s.logFile, payload); err != nil {
+		return fmt.Errorf("write wal frame payload: %w", err)
+	}
+	if err := s.logFile.Sync(); err != nil {
+		return fmt.Errorf("sync wal: %w", err)
 	}
 	return nil
 }
 
-func (s *kvServer) applyCommand(cmd *kvpb.WALCommand) {
+func (s *kvServer) applyCommand(cmd walCommand) {
 	switch cmd.Op {
-	case kvpb.WALCommand_OP_PUT, kvpb.WALCommand_OP_SWAP:
+	case "put", "swap":
 		_ = s.tree.ReplaceOrInsert(item{key: cmd.Key, value: cmd.Value})
-	case kvpb.WALCommand_OP_DELETE:
+	case "delete":
 		_ = s.tree.Delete(item{key: cmd.Key})
 	}
 }
@@ -135,15 +181,10 @@ func (s *kvServer) Put(ctx context.Context, req *kvpb.PutRequest) (*kvpb.PutRepl
 	defer s.mu.Unlock()
 
 	prev := s.tree.Get(item{key: req.Key})
-	cmd := &kvpb.WALCommand{
-		Op:    kvpb.WALCommand_OP_PUT,
-		Key:   req.Key,
-		Value: req.Value,
-	}
-	if err := s.appendLog(cmd); err != nil {
+	if err := s.appendWAL(walCommand{Op: "put", Key: req.Key, Value: req.Value}); err != nil {
 		return nil, err
 	}
-	s.applyCommand(cmd)
+	s.applyCommand(walCommand{Op: "put", Key: req.Key, Value: req.Value})
 	return &kvpb.PutReply{Found: prev != nil}, nil
 }
 
@@ -164,15 +205,10 @@ func (s *kvServer) Swap(ctx context.Context, req *kvpb.SwapRequest) (*kvpb.SwapR
 	defer s.mu.Unlock()
 
 	got := s.tree.Get(item{key: req.Key})
-	cmd := &kvpb.WALCommand{
-		Op:    kvpb.WALCommand_OP_SWAP,
-		Key:   req.Key,
-		Value: req.Value,
-	}
-	if err := s.appendLog(cmd); err != nil {
+	if err := s.appendWAL(walCommand{Op: "swap", Key: req.Key, Value: req.Value}); err != nil {
 		return nil, err
 	}
-	s.applyCommand(cmd)
+	s.applyCommand(walCommand{Op: "swap", Key: req.Key, Value: req.Value})
 
 	if got == nil {
 		return &kvpb.SwapReply{Found: false}, nil
@@ -185,14 +221,10 @@ func (s *kvServer) Delete(ctx context.Context, req *kvpb.DeleteRequest) (*kvpb.D
 	defer s.mu.Unlock()
 
 	del := s.tree.Get(item{key: req.Key})
-	cmd := &kvpb.WALCommand{
-		Op:  kvpb.WALCommand_OP_DELETE,
-		Key: req.Key,
-	}
-	if err := s.appendLog(cmd); err != nil {
+	if err := s.appendWAL(walCommand{Op: "delete", Key: req.Key}); err != nil {
 		return nil, err
 	}
-	s.applyCommand(cmd)
+	s.applyCommand(walCommand{Op: "delete", Key: req.Key})
 	return &kvpb.DeleteReply{Found: del != nil}, nil
 }
 
@@ -218,7 +250,7 @@ func (s *kvServer) Scan(ctx context.Context, req *kvpb.ScanRequest) (*kvpb.ScanR
 
 func main() {
 	listenAddr := flag.String("listen", "127.0.0.1:50051", "ip:port to listen on")
-	backerDir := flag.String("backer", "data", "directory where durable server state is stored")
+	logPath := flag.String("wal", "data/server.wal", "path to durable write-ahead log")
 	flag.Parse()
 
 	lis, err := net.Listen("tcp", *listenAddr)
@@ -226,20 +258,16 @@ func main() {
 		log.Fatalf("listen failed: %v", err)
 	}
 
-	srv, err := newKVServer(*backerDir)
+	srv, err := newKVServer(*logPath)
 	if err != nil {
 		log.Fatalf("server init failed: %v", err)
 	}
-	defer func() {
-		if err := srv.db.Close(); err != nil && !errors.Is(err, sql.ErrConnDone) {
-			log.Printf("db close failed: %v", err)
-		}
-	}()
+	defer srv.logFile.Close()
 
 	grpcServer := grpc.NewServer()
 	kvpb.RegisterKVSServer(grpcServer, srv)
 
-	fmt.Printf("server listening on %s with backer dir %s\n", *listenAddr, *backerDir)
+	fmt.Printf("server listening on %s with wal %s\n", *listenAddr, *logPath)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("serve failed: %v", err)
 	}
