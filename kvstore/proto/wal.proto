@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+option go_package = "madkv/kvstore/gen/kvpb;kvpb";
+
+message WALCommand {
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    OP_PUT = 1;
+    OP_SWAP = 2;
+    OP_DELETE = 3;
+  }
+
+  Op op = 1;
+  string key = 2;
+  string value = 3;
+}

@@ -6,15 +6,50 @@ default:
 
 # install extra dependencies of your KV code
 deps:
-    # FIXME: your dependency installation commands here
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd kvstore
+    export PATH="$(go env GOPATH)/bin:$PATH"
+    if ! command -v protoc >/dev/null 2>&1; then
+        echo "protoc not found; please install Protocol Buffers (protoc) first."
+        exit 1
+    fi
+    go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+    if [ ! -f go.mod ]; then
+        go mod init madkv/kvstore
+    fi
+    go get google.golang.org/grpc
+    go get google.golang.org/protobuf
+    go get github.com/google/btree
+    go get modernc.org/sqlite
+    mkdir -p gen/kvpb
+    protoc --go_out=. --go_opt=module=madkv/kvstore \
+           --go-grpc_out=. --go-grpc_opt=module=madkv/kvstore \
+           proto/kvstore.proto \
+           proto/wal.proto
+    go mod tidy
+    echo "*******Dependencies installed and protobuf code generated*******"
 
 # build your executables in release mode
 build:
-    # FIXME: your build commands here (don't include clean)
+    cd kvstore && mkdir -p bin
+    cd kvstore && go build -o bin/server ./server
+    cd kvstore && go build -o bin/client ./client
+    @echo "*******Built server and client binaries*******"
 
 # clean the build of your executables
 clean:
-    # FIXME: your clean commands here
+    rm -rf kvstore/bin
+    rm -rf kvstore/gen
+    rm -rf kvstore/.gocache
+    @echo "*******Cleaned build artifacts*******"
+
+# run tests for your KV code
+test:
+    cd kvstore && mkdir -p .gocache
+    cd kvstore && GOCACHE="$(pwd)/.gocache" go test ./... -count=1
+    @echo "*******All tests passed*******"
 
 # run your KV store manager
 manager man_port="3666" servers="127.0.0.1:3777,127.0.0.1:3778,127.0.0.1:3779":
