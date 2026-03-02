@@ -14,29 +14,32 @@ deps:
         echo "protoc not found; please install Protocol Buffers (protoc) first."
         exit 1
     fi
-    go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+    if ! command -v protoc-gen-go >/dev/null 2>&1; then
+        echo "protoc-gen-go not found in PATH; install it first."
+        exit 1
+    fi
+    if ! command -v protoc-gen-go-grpc >/dev/null 2>&1; then
+        echo "protoc-gen-go-grpc not found in PATH; install it first."
+        exit 1
+    fi
     if [ ! -f go.mod ]; then
         go mod init madkv/kvstore
     fi
-    go get google.golang.org/grpc
-    go get google.golang.org/protobuf
-    go get github.com/google/btree
-    go get modernc.org/sqlite
     mkdir -p gen/kvpb
     protoc --go_out=. --go_opt=module=madkv/kvstore \
            --go-grpc_out=. --go-grpc_opt=module=madkv/kvstore \
            proto/kvstore.proto \
+           proto/manager.proto \
            proto/wal.proto
-    go mod tidy
     echo "*******Dependencies installed and protobuf code generated*******"
 
 # build your executables in release mode
 build:
     cd kvstore && mkdir -p bin
+    cd kvstore && go build -o bin/manager ./manager
     cd kvstore && go build -o bin/server ./server
     cd kvstore && go build -o bin/client ./client
-    @echo "*******Built server and client binaries*******"
+    @echo "*******Built manager, server, and client binaries*******"
 
 # clean the build of your executables
 clean:
@@ -53,30 +56,25 @@ test:
 
 # run your KV store manager
 manager man_port="3666" servers="127.0.0.1:3777,127.0.0.1:3778,127.0.0.1:3779":
-    # FIXME: your manager run command here, listening on 0.0.0.0:man_port for
-    #        both server and client registration requests
+    cd kvstore && ./bin/manager --listen "0.0.0.0:{{man_port}}" --servers "{{servers}}"
 
 # run your KV store server
 server id="0" manager="127.0.0.1:3666" api_port="3777" backer_path="./backer.s0":
-    # FIXME: your server run command here. The server should first contact the
-    #        manager to get its assignment of key range(s). It then listens on
-    #        0.0.0.0:api_port for new clients, and stores all durable state
-    #        under backer_path
+    cd kvstore && ./bin/server \
+        --id "{{id}}" \
+        --manager "{{manager}}" \
+        --listen "0.0.0.0:{{api_port}}" \
+        --backer "{{backer_path}}"
 
 # run you KV store client in stdin/out interface mode
 client manager="127.0.0.1:3666":
-    # FIXME: your client run command here, querying manager at addr for server
-    #        registration information
+    cd kvstore && ./bin/client --manager "{{manager}}"
 
 # kill all processes of your KV store system
 kill:
-    # FIXME: your kill commands here
-    #        make sure that it kills all server, clients, and any extra helper
-    #        processes of your system; redirecting both out & err to /dev/null
-    #        is recommended
-    #   TIP: commands such as 'pkill' may return non-zero exit code on success,
-    #        which would by default abort the 'just' recipe early; prepend the
-    #        command with a '-' sign to ignore its exit code
+    -pkill -f 'kvstore/bin/manager' >/dev/null 2>&1
+    -pkill -f 'kvstore/bin/server' >/dev/null 2>&1
+    -pkill -f 'kvstore/bin/client' >/dev/null 2>&1
 
 # NOTE: feel free to add more recipes as you see fit...
 #       also feel free to add extra parameters to the recipes as you see fit,

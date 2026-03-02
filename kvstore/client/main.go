@@ -5,8 +5,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,76 +18,175 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+type routedClient struct {
+	serverAddrs []string
+	timeout     time.Duration
+	retry       time.Duration
+	conns       []*grpc.ClientConn
+	clients     []kvpb.KVSClient
+}
+
+func newRoutedClient(serverAddrs []string, timeout, retry time.Duration) *routedClient {
+	return &routedClient{
+		serverAddrs: serverAddrs,
+		timeout:     timeout,
+		retry:       retry,
+		conns:       make([]*grpc.ClientConn, len(serverAddrs)),
+		clients:     make([]kvpb.KVSClient, len(serverAddrs)),
+	}
+}
+
+func ownerForKey(key string, numServers int) int {
+	if numServers <= 1 {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % uint32(numServers))
+}
+
+func (c *routedClient) close() {
+	for i := range c.conns {
+		if c.conns[i] != nil {
+			_ = c.conns[i].Close()
+			c.conns[i] = nil
+			c.clients[i] = nil
+		}
+	}
+}
+
+func (c *routedClient) ensureConn(serverID int) (kvpb.KVSClient, error) {
+	if c.clients[serverID] != nil {
+		return c.clients[serverID], nil
+	}
+	conn, err := grpc.NewClient(c.serverAddrs[serverID], grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+	c.conns[serverID] = conn
+	c.clients[serverID] = kvpb.NewKVSClient(conn)
+	return c.clients[serverID], nil
+}
+
+func (c *routedClient) resetConn(serverID int) {
+	if c.conns[serverID] != nil {
+		_ = c.conns[serverID].Close()
+	}
+	c.conns[serverID] = nil
+	c.clients[serverID] = nil
+}
+
+func fetchClusterInfo(managerAddr string, timeout, retry time.Duration) []string {
+	for {
+		conn, err := grpc.NewClient(managerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			log.Printf("manager dial failed: %v", err)
+			time.Sleep(retry)
+			continue
+		}
+		mc := kvpb.NewClusterManagerClient(conn)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		resp, err := mc.GetClusterInfo(ctx, &kvpb.GetClusterInfoRequest{})
+		cancel()
+		_ = conn.Close()
+		if err != nil {
+			log.Printf("manager query failed: %v", err)
+			time.Sleep(retry)
+			continue
+		}
+		if !resp.Ready || len(resp.ServerAddrs) == 0 {
+			log.Printf("manager not ready yet; retrying")
+			time.Sleep(retry)
+			continue
+		}
+		return resp.ServerAddrs
+	}
+}
+
+func (c *routedClient) callSingleServer(serverID int, fn func(context.Context, kvpb.KVSClient) error) {
+	for {
+		client, err := c.ensureConn(serverID)
+		if err != nil {
+			log.Printf("server dial failed (%s): %v", c.serverAddrs[serverID], err)
+			time.Sleep(c.retry)
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+		err = fn(ctx, client)
+		cancel()
+		if err == nil {
+			return
+		}
+
+		log.Printf("server rpc failed (%s): %v; retrying", c.serverAddrs[serverID], err)
+		c.resetConn(serverID)
+		time.Sleep(c.retry)
+	}
+}
+
 func usage() {
 	fmt.Fprintf(os.Stderr, `Usage (CLI mode):
-  client --server <ip:port> --op put    --key <k> --value <v>
-  client --server <ip:port> --op get    --key <k>
-  client --server <ip:port> --op swap   --key <k> --value <v>
-  client --server <ip:port> --op delete --key <k>
-  client --server <ip:port> --op scan   --start <k1> --end <k2>
+  client --manager <ip:port> --op put    --key <k> --value <v>
+  client --manager <ip:port> --op get    --key <k>
+  client --manager <ip:port> --op swap   --key <k> --value <v>
+  client --manager <ip:port> --op delete --key <k>
+  client --manager <ip:port> --op scan   --start <k1> --end <k2>
 
 Usage (stdin/stdout mode):
-  client --server <ip:port>
-  (then read operations from stdin, one per line)
-
-Examples:
-  client --server 127.0.0.1:50051 --op put --key a --value 1
-  client --server 127.0.0.1:50051 --op get --key a
-  client --server 127.0.0.1:50051 --op scan --start a --end z
+  client --manager <ip:port>
 `)
 }
 
 func main() {
-	serverAddr := flag.String("server", "127.0.0.1:50051", "server ip:port")
+	managerAddr := flag.String("manager", "127.0.0.1:3666", "manager ip:port")
 	op := flag.String("op", "", "operation: put|get|swap|delete|scan")
 	key := flag.String("key", "", "key for put/get/swap/delete")
 	value := flag.String("value", "", "value for put/swap")
 	start := flag.String("start", "", "scan start key")
 	end := flag.String("end", "", "scan end key")
 	timeout := flag.Duration("timeout", 2*time.Second, "rpc timeout")
+	retry := flag.Duration("retry_interval", time.Second, "retry interval")
 	flag.Usage = usage
 	flag.Parse()
 
-	conn, err := grpc.Dial(*serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("dial failed: %v", err)
-	}
-	defer conn.Close()
+	serverAddrs := fetchClusterInfo(*managerAddr, *timeout, *retry)
+	rc := newRoutedClient(serverAddrs, *timeout, *retry)
+	defer rc.close()
 
-	c := kvpb.NewKVSClient(conn)
-
-	// If --op is provided, run in CLI mode; otherwise, run in stdin/stdout mode
 	if *op != "" {
-		cliMode(c, *timeout, *op, *key, *value, *start, *end)
+		cliMode(rc, strings.ToLower(*op), *key, *value, *start, *end)
 	} else {
-		stdinMode(c, *timeout)
+		stdinMode(rc)
 	}
 }
 
-func cliMode(c kvpb.KVSClient, timeout time.Duration, op, key, value, start, end string) {
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	switch strings.ToLower(op) {
+func cliMode(c *routedClient, op, key, value, start, end string) {
+	switch op {
 	case "put":
 		if key == "" || value == "" {
 			log.Fatalf("put requires --key and --value")
 		}
-		resp, err := c.Put(ctx, &kvpb.PutRequest{Key: key, Value: value})
-		if err != nil {
-			log.Fatalf("Put RPC failed: %v", err)
-		}
+		var resp *kvpb.PutReply
+		sid := ownerForKey(key, len(c.serverAddrs))
+		c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
+			var err error
+			resp, err = cli.Put(ctx, &kvpb.PutRequest{Key: key, Value: value})
+			return err
+		})
 		fmt.Printf("PUT %s %s (found=%v)\n", key, value, resp.Found)
 
 	case "get":
 		if key == "" {
 			log.Fatalf("get requires --key")
 		}
-		resp, err := c.Get(ctx, &kvpb.GetRequest{Key: key})
-		if err != nil {
-			log.Fatalf("Get RPC failed: %v", err)
-		}
+		var resp *kvpb.GetReply
+		sid := ownerForKey(key, len(c.serverAddrs))
+		c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
+			var err error
+			resp, err = cli.Get(ctx, &kvpb.GetRequest{Key: key})
+			return err
+		})
 		if !resp.Found {
 			fmt.Printf("GET %s null\n", key)
 		} else {
@@ -96,10 +197,13 @@ func cliMode(c kvpb.KVSClient, timeout time.Duration, op, key, value, start, end
 		if key == "" || value == "" {
 			log.Fatalf("swap requires --key and --value")
 		}
-		resp, err := c.Swap(ctx, &kvpb.SwapRequest{Key: key, Value: value})
-		if err != nil {
-			log.Fatalf("Swap RPC failed: %v", err)
-		}
+		var resp *kvpb.SwapReply
+		sid := ownerForKey(key, len(c.serverAddrs))
+		c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
+			var err error
+			resp, err = cli.Swap(ctx, &kvpb.SwapRequest{Key: key, Value: value})
+			return err
+		})
 		if !resp.Found {
 			fmt.Printf("SWAP %s null\n", key)
 		} else {
@@ -110,22 +214,22 @@ func cliMode(c kvpb.KVSClient, timeout time.Duration, op, key, value, start, end
 		if key == "" {
 			log.Fatalf("delete requires --key")
 		}
-		resp, err := c.Delete(ctx, &kvpb.DeleteRequest{Key: key})
-		if err != nil {
-			log.Fatalf("Delete RPC failed: %v", err)
-		}
+		var resp *kvpb.DeleteReply
+		sid := ownerForKey(key, len(c.serverAddrs))
+		c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
+			var err error
+			resp, err = cli.Delete(ctx, &kvpb.DeleteRequest{Key: key})
+			return err
+		})
 		fmt.Printf("DELETE %s (found=%v)\n", key, resp.Found)
 
 	case "scan":
 		if start == "" || end == "" {
 			log.Fatalf("scan requires --start and --end")
 		}
-		resp, err := c.Scan(ctx, &kvpb.ScanRequest{StartKey: start, EndKey: end})
-		if err != nil {
-			log.Fatalf("Scan RPC failed: %v", err)
-		}
-		fmt.Printf("SCAN %s %s (%d pairs)\n", start, end, len(resp.Pairs))
-		for _, p := range resp.Pairs {
+		pairs := scanAll(c, start, end)
+		fmt.Printf("SCAN %s %s (%d pairs)\n", start, end, len(pairs))
+		for _, p := range pairs {
 			fmt.Printf("  %s %s\n", p.Key, p.Value)
 		}
 
@@ -134,13 +238,27 @@ func cliMode(c kvpb.KVSClient, timeout time.Duration, op, key, value, start, end
 	}
 }
 
-func stdinMode(c kvpb.KVSClient, timeout time.Duration) {
+func scanAll(c *routedClient, startKey, endKey string) []*kvpb.KVPair {
+	merged := make([]*kvpb.KVPair, 0)
+	for sid := range c.serverAddrs {
+		var resp *kvpb.ScanReply
+		c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
+			var err error
+			resp, err = cli.Scan(ctx, &kvpb.ScanRequest{StartKey: startKey, EndKey: endKey})
+			return err
+		})
+		merged = append(merged, resp.Pairs...)
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].Key < merged[j].Key })
+	return merged
+}
+
+func stdinMode(c *routedClient) {
 	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // Allow large lines for scan results
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		// Skip empty lines
 		if line == "" {
 			continue
 		}
@@ -149,45 +267,41 @@ func stdinMode(c kvpb.KVSClient, timeout time.Duration) {
 		if len(parts) == 0 {
 			continue
 		}
-
 		cmd := strings.ToUpper(parts[0])
-
-		// Execute the command and print response
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
 		switch cmd {
 		case "PUT":
 			if len(parts) < 3 {
 				log.Printf("PUT requires 2 arguments: key value")
-				cancel()
 				continue
 			}
 			k, v := parts[1], parts[2]
-			resp, err := c.Put(ctx, &kvpb.PutRequest{Key: k, Value: v})
-			if err != nil {
-				log.Printf("Put RPC failed: %v", err)
-				cancel()
-				continue
-			}
-			found := "not_found"
+			sid := ownerForKey(k, len(c.serverAddrs))
+			var resp *kvpb.PutReply
+			c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
+				var err error
+				resp, err = cli.Put(ctx, &kvpb.PutRequest{Key: k, Value: v})
+				return err
+			})
 			if resp.Found {
-				found = "found"
+				fmt.Printf("PUT %s found\n", k)
+			} else {
+				fmt.Printf("PUT %s not_found\n", k)
 			}
-			fmt.Printf("PUT %s %s\n", k, found)
 
 		case "GET":
 			if len(parts) < 2 {
 				log.Printf("GET requires 1 argument: key")
-				cancel()
 				continue
 			}
 			k := parts[1]
-			resp, err := c.Get(ctx, &kvpb.GetRequest{Key: k})
-			if err != nil {
-				log.Printf("Get RPC failed: %v", err)
-				cancel()
-				continue
-			}
+			sid := ownerForKey(k, len(c.serverAddrs))
+			var resp *kvpb.GetReply
+			c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
+				var err error
+				resp, err = cli.Get(ctx, &kvpb.GetRequest{Key: k})
+				return err
+			})
 			if !resp.Found {
 				fmt.Printf("GET %s null\n", k)
 			} else {
@@ -197,16 +311,16 @@ func stdinMode(c kvpb.KVSClient, timeout time.Duration) {
 		case "SWAP":
 			if len(parts) < 3 {
 				log.Printf("SWAP requires 2 arguments: key value")
-				cancel()
 				continue
 			}
 			k, v := parts[1], parts[2]
-			resp, err := c.Swap(ctx, &kvpb.SwapRequest{Key: k, Value: v})
-			if err != nil {
-				log.Printf("Swap RPC failed: %v", err)
-				cancel()
-				continue
-			}
+			sid := ownerForKey(k, len(c.serverAddrs))
+			var resp *kvpb.SwapReply
+			c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
+				var err error
+				resp, err = cli.Swap(ctx, &kvpb.SwapRequest{Key: k, Value: v})
+				return err
+			})
 			if !resp.Found {
 				fmt.Printf("SWAP %s null\n", k)
 			} else {
@@ -216,37 +330,31 @@ func stdinMode(c kvpb.KVSClient, timeout time.Duration) {
 		case "DELETE":
 			if len(parts) < 2 {
 				log.Printf("DELETE requires 1 argument: key")
-				cancel()
 				continue
 			}
 			k := parts[1]
-			resp, err := c.Delete(ctx, &kvpb.DeleteRequest{Key: k})
-			if err != nil {
-				log.Printf("Delete RPC failed: %v", err)
-				cancel()
-				continue
-			}
-			found := "not_found"
+			sid := ownerForKey(k, len(c.serverAddrs))
+			var resp *kvpb.DeleteReply
+			c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
+				var err error
+				resp, err = cli.Delete(ctx, &kvpb.DeleteRequest{Key: k})
+				return err
+			})
 			if resp.Found {
-				found = "found"
+				fmt.Printf("DELETE %s found\n", k)
+			} else {
+				fmt.Printf("DELETE %s not_found\n", k)
 			}
-			fmt.Printf("DELETE %s %s\n", k, found)
 
 		case "SCAN":
 			if len(parts) < 3 {
 				log.Printf("SCAN requires 2 arguments: start_key end_key")
-				cancel()
 				continue
 			}
 			startKey, endKey := parts[1], parts[2]
-			resp, err := c.Scan(ctx, &kvpb.ScanRequest{StartKey: startKey, EndKey: endKey})
-			if err != nil {
-				log.Printf("Scan RPC failed: %v", err)
-				cancel()
-				continue
-			}
+			pairs := scanAll(c, startKey, endKey)
 			fmt.Printf("SCAN %s %s BEGIN\n", startKey, endKey)
-			for _, pair := range resp.Pairs {
+			for _, pair := range pairs {
 				fmt.Printf("  %s %s\n", pair.Key, pair.Value)
 			}
 			fmt.Println("SCAN END")
@@ -254,23 +362,16 @@ func stdinMode(c kvpb.KVSClient, timeout time.Duration) {
 		case "STOP":
 			if len(parts) != 1 {
 				log.Printf("STOP takes no arguments")
-				cancel()
 				continue
 			}
-			// Echo STOP so the runner's driver can observe the client's stop
-			// response and avoid timing out waiting on the response channel.
 			fmt.Println("STOP")
-			cancel()
 			return
 
 		default:
 			log.Printf("unknown command: %s", cmd)
 		}
-
-		cancel()
 	}
 
-	// Handle scanner errors
 	if err := scanner.Err(); err != nil {
 		log.Fatalf("scanner error: %v", err)
 	}

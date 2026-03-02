@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+option go_package = "madkv/kvstore/gen/kvpb;kvpb";
+
+service ClusterManager {
+  rpc RegisterServer(RegisterServerRequest) returns (RegisterServerReply);
+  rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoReply);
+}
+
+message RegisterServerRequest {
+  uint32 server_id = 1;
+  string api_addr = 2;
+}
+
+message RegisterServerReply {
+  uint32 num_servers = 1;
+  string assigned_api_addr = 2;
+}
+
+message GetClusterInfoRequest {}
+
+message GetClusterInfoReply {
+  bool ready = 1;
+  repeated string server_addrs = 2;
+}

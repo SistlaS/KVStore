@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	kvpb "madkv/kvstore/gen/kvpb"
 	_ "modernc.org/sqlite"
@@ -160,5 +163,30 @@ func TestRecoveryFromPreexistingBackerDir(t *testing.T) {
 	}
 	if got, err := srv.Get(ctx, &kvpb.GetRequest{Key: "beta"}); err != nil || !got.Found || got.Value != "2" {
 		t.Fatalf("Get(beta) after startup replay = (%v, %v), want found=true value=2", got, err)
+	}
+}
+
+func TestPartitionOwnershipEnforced(t *testing.T) {
+	ctx := context.Background()
+	srv, err := newKVServerWithPartition(t.TempDir(), 0, 2)
+	if err != nil {
+		t.Fatalf("newKVServerWithPartition() failed: %v", err)
+	}
+	defer srv.db.Close()
+
+	wrongKey := "k0"
+	for i := 0; i < 10000 && ownerForKey(wrongKey, 2) == 0; i++ {
+		wrongKey = fmt.Sprintf("k%d", i+1)
+	}
+	if ownerForKey(wrongKey, 2) == 0 {
+		t.Fatalf("failed to find a key owned by partition 1")
+	}
+	_, err = srv.Put(ctx, &kvpb.PutRequest{Key: wrongKey, Value: "v"})
+	if err == nil {
+		t.Fatalf("Put on wrong partition key should fail")
+	}
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got err=%v", err)
 	}
 }
