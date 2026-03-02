@@ -239,6 +239,17 @@ func cliMode(c *routedClient, op, key, value, start, end string) {
 }
 
 func scanAll(c *routedClient, startKey, endKey string) []*kvpb.KVPair {
+	if startKey == endKey {
+		sid := ownerForKey(startKey, len(c.serverAddrs))
+		var resp *kvpb.ScanReply
+		c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
+			var err error
+			resp, err = cli.Scan(ctx, &kvpb.ScanRequest{StartKey: startKey, EndKey: endKey})
+			return err
+		})
+		return resp.Pairs
+	}
+
 	merged := make([]*kvpb.KVPair, 0)
 	for sid := range c.serverAddrs {
 		var resp *kvpb.ScanReply

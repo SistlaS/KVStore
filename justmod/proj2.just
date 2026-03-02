@@ -36,9 +36,10 @@ deps:
 # build your executables in release mode
 build:
     cd kvstore && mkdir -p bin
-    cd kvstore && go build -o bin/manager ./manager
-    cd kvstore && go build -o bin/server ./server
-    cd kvstore && go build -o bin/client ./client
+    cd kvstore && mkdir -p .gocache
+    cd kvstore && GOCACHE="$(pwd)/.gocache" go build -o bin/manager ./manager
+    cd kvstore && GOCACHE="$(pwd)/.gocache" go build -o bin/server ./server
+    cd kvstore && GOCACHE="$(pwd)/.gocache" go build -o bin/client ./client
     @echo "*******Built manager, server, and client binaries*******"
 
 # clean the build of your executables
@@ -46,13 +47,139 @@ clean:
     rm -rf kvstore/bin
     rm -rf kvstore/gen
     rm -rf kvstore/.gocache
+    rm -rf tmp/madkv-p2
     @echo "*******Cleaned build artifacts*******"
 
 # run tests for your KV code
 test:
+    just p2::deps
     cd kvstore && mkdir -p .gocache
     cd kvstore && GOCACHE="$(pwd)/.gocache" go test ./... -count=1
+    just p2::build
+    just p2::testcase
     @echo "*******All tests passed*******"
+
+# run the required deterministic demo testcase
+testcase manager="127.0.0.1:3666" servers="127.0.0.1:3777,127.0.0.1:3778,127.0.0.1:3779": (tmpdir "tests")
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd kvstore
+    run_id="$(date +%s)_$RANDOM"
+    out_dir="../tmp/madkv-p2/tests"
+    mkdir -p "$out_dir"
+    log="$out_dir/testcase-${run_id}.log"
+    mgr_log="$out_dir/manager-${run_id}.log"
+    s0_log="$out_dir/server0-${run_id}.log"
+    s1_log="$out_dir/server1-${run_id}.log"
+    s2_log="$out_dir/server2-${run_id}.log"
+    backer_base="$out_dir/backer-${run_id}"
+    IFS=',' read -r s0 s1 s2 <<< "{{servers}}"
+    p0="${s0##*:}"
+    p1="${s1##*:}"
+    p2="${s2##*:}"
+    run_with_timeout() {
+        local secs="$1"
+        shift
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "${secs}s" "$@"
+            return $?
+        fi
+        if command -v gtimeout >/dev/null 2>&1; then
+            gtimeout "${secs}s" "$@"
+            return $?
+        fi
+        python3 -c $'import subprocess,sys\nsecs=float(sys.argv[1])\ncmd=sys.argv[2:]\ntry:\n    p=subprocess.run(cmd, timeout=secs)\n    sys.exit(p.returncode)\nexcept subprocess.TimeoutExpired:\n    sys.exit(124)' "$secs" "$@"
+    }
+    cleanup() {
+        for pid in "${s0_pid:-}" "${s1_pid:-}" "${s2_pid:-}" "${mgr_pid:-}"; do
+            if [ -n "${pid}" ] && kill -0 "${pid}" >/dev/null 2>&1; then
+                kill "${pid}" >/dev/null 2>&1 || true
+                wait "${pid}" >/dev/null 2>&1 || true
+            fi
+        done
+    }
+    trap cleanup EXIT
+    ./bin/manager --listen "{{manager}}" --servers "{{servers}}" >"$mgr_log" 2>&1 &
+    mgr_pid=$!
+    ./bin/server --id 0 --manager "{{manager}}" --listen "0.0.0.0:${p0}" --backer "${backer_base}.s0" >"$s0_log" 2>&1 &
+    s0_pid=$!
+    ./bin/server --id 1 --manager "{{manager}}" --listen "0.0.0.0:${p1}" --backer "${backer_base}.s1" >"$s1_log" 2>&1 &
+    s1_pid=$!
+    ./bin/server --id 2 --manager "{{manager}}" --listen "0.0.0.0:${p2}" --backer "${backer_base}.s2" >"$s2_log" 2>&1 &
+    s2_pid=$!
+    for _ in $(seq 1 60); do
+        if run_with_timeout 2 ./bin/client --manager "{{manager}}" --op get --key k0 >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.2
+    done
+    assert() {
+        local needle="$1"
+        if ! grep -Fq "$needle" "$log"; then
+            echo "assert failed: $needle" >&2
+            echo "---- testcase log ----" >&2
+            cat "$log" >&2
+            exit 1
+        fi
+    }
+    {
+        echo "=== init writes/reads ==="
+        printf '%s\n' \
+            "PUT k0 v0" \
+            "PUT k1 v1" \
+            "PUT k3 v3" \
+            "PUT k7 v7" \
+            "SWAP k0 v0b" \
+            "SWAP k1 v1b" \
+            "SWAP k3 v3b" \
+            "GET k0" \
+            "GET k1" \
+            "GET k3" \
+            "SCAN k0 k3" \
+            "STOP" \
+            | ./bin/client --manager "{{manager}}"
+        echo "=== kill server 1 ==="
+        kill "$s1_pid"
+        wait "$s1_pid" 2>/dev/null || true
+        s1_pid=""
+        echo "=== unaffected get+scan (partition 0) ==="
+        run_with_timeout 4 ./bin/client --manager "{{manager}}" --op get --key k1
+        run_with_timeout 4 ./bin/client --manager "{{manager}}" --op scan --start k1 --end k1
+        echo "=== affected get should timeout (partition 1) ==="
+        if run_with_timeout 4 ./bin/client --manager "{{manager}}" --op get --key k0; then
+            echo "expected timeout on failed partition but command succeeded"
+            exit 1
+        else
+            rc=$?
+            if [ "$rc" -ne 124 ]; then
+                echo "expected timeout exit code 124, got $rc"
+                exit 1
+            fi
+            echo "timeout observed as expected"
+        fi
+        echo "=== restart server 1 ==="
+        ./bin/server --id 1 --manager "{{manager}}" --listen "0.0.0.0:${p1}" --backer "${backer_base}.s1" >"$s1_log" 2>&1 &
+        s1_pid=$!
+        for _ in $(seq 1 60); do
+            if run_with_timeout 3 ./bin/client --manager "{{manager}}" --op get --key k0 >/dev/null 2>&1; then
+                break
+            fi
+            sleep 0.2
+        done
+        echo "=== recovered partition check ==="
+        run_with_timeout 4 ./bin/client --manager "{{manager}}" --op get --key k0
+    } | tee "$log"
+    assert "PUT k0 not_found"
+    assert "PUT k1 not_found"
+    assert "PUT k3 not_found"
+    assert "SWAP k0 v0"
+    assert "SWAP k1 v1"
+    assert "SWAP k3 v3"
+    assert "GET k1 v1b"
+    assert "SCAN k1 k1"
+    assert "timeout observed as expected"
+    assert "GET k0 v0b"
+    echo "deterministic testcase passed: $log"
 
 # run your KV store manager
 manager man_port="3666" servers="127.0.0.1:3777,127.0.0.1:3778,127.0.0.1:3779":
