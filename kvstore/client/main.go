@@ -9,13 +9,16 @@ import (
 	"log"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	kvpb "madkv/kvstore/gen/kvpb"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 type routedClient struct {
@@ -24,15 +27,19 @@ type routedClient struct {
 	retry       time.Duration
 	conns       []*grpc.ClientConn
 	clients     []kvpb.KVSClient
+	clientID    string
+	nextReqID   uint64
 }
 
 func newRoutedClient(serverAddrs []string, timeout, retry time.Duration) *routedClient {
+	clientID := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
 	return &routedClient{
 		serverAddrs: serverAddrs,
 		timeout:     timeout,
 		retry:       retry,
 		conns:       make([]*grpc.ClientConn, len(serverAddrs)),
 		clients:     make([]kvpb.KVSClient, len(serverAddrs)),
+		clientID:    clientID,
 	}
 }
 
@@ -125,6 +132,11 @@ func (c *routedClient) callSingleServer(serverID int, fn func(context.Context, k
 	}
 }
 
+func (c *routedClient) nextMutationRequestID() string {
+	seq := atomic.AddUint64(&c.nextReqID, 1)
+	return c.clientID + "-" + strconv.FormatUint(seq, 10)
+}
+
 func usage() {
 	fmt.Fprintf(os.Stderr, `Usage (CLI mode):
   client --manager <ip:port> --op put    --key <k> --value <v>
@@ -168,9 +180,11 @@ func cliMode(c *routedClient, op, key, value, start, end string) {
 			log.Fatalf("put requires --key and --value")
 		}
 		var resp *kvpb.PutReply
+		reqID := c.nextMutationRequestID()
 		sid := ownerForKey(key, len(c.serverAddrs))
 		c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
 			var err error
+			ctx = metadata.AppendToOutgoingContext(ctx, "x-request-id", reqID)
 			resp, err = cli.Put(ctx, &kvpb.PutRequest{Key: key, Value: value})
 			return err
 		})
@@ -198,9 +212,11 @@ func cliMode(c *routedClient, op, key, value, start, end string) {
 			log.Fatalf("swap requires --key and --value")
 		}
 		var resp *kvpb.SwapReply
+		reqID := c.nextMutationRequestID()
 		sid := ownerForKey(key, len(c.serverAddrs))
 		c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
 			var err error
+			ctx = metadata.AppendToOutgoingContext(ctx, "x-request-id", reqID)
 			resp, err = cli.Swap(ctx, &kvpb.SwapRequest{Key: key, Value: value})
 			return err
 		})
@@ -215,9 +231,11 @@ func cliMode(c *routedClient, op, key, value, start, end string) {
 			log.Fatalf("delete requires --key")
 		}
 		var resp *kvpb.DeleteReply
+		reqID := c.nextMutationRequestID()
 		sid := ownerForKey(key, len(c.serverAddrs))
 		c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
 			var err error
+			ctx = metadata.AppendToOutgoingContext(ctx, "x-request-id", reqID)
 			resp, err = cli.Delete(ctx, &kvpb.DeleteRequest{Key: key})
 			return err
 		})
@@ -289,8 +307,10 @@ func stdinMode(c *routedClient) {
 			k, v := parts[1], parts[2]
 			sid := ownerForKey(k, len(c.serverAddrs))
 			var resp *kvpb.PutReply
+			reqID := c.nextMutationRequestID()
 			c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
 				var err error
+				ctx = metadata.AppendToOutgoingContext(ctx, "x-request-id", reqID)
 				resp, err = cli.Put(ctx, &kvpb.PutRequest{Key: k, Value: v})
 				return err
 			})
@@ -327,8 +347,10 @@ func stdinMode(c *routedClient) {
 			k, v := parts[1], parts[2]
 			sid := ownerForKey(k, len(c.serverAddrs))
 			var resp *kvpb.SwapReply
+			reqID := c.nextMutationRequestID()
 			c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
 				var err error
+				ctx = metadata.AppendToOutgoingContext(ctx, "x-request-id", reqID)
 				resp, err = cli.Swap(ctx, &kvpb.SwapRequest{Key: k, Value: v})
 				return err
 			})
@@ -346,8 +368,10 @@ func stdinMode(c *routedClient) {
 			k := parts[1]
 			sid := ownerForKey(k, len(c.serverAddrs))
 			var resp *kvpb.DeleteReply
+			reqID := c.nextMutationRequestID()
 			c.callSingleServer(sid, func(ctx context.Context, cli kvpb.KVSClient) error {
 				var err error
+				ctx = metadata.AppendToOutgoingContext(ctx, "x-request-id", reqID)
 				resp, err = cli.Delete(ctx, &kvpb.DeleteRequest{Key: k})
 				return err
 			})

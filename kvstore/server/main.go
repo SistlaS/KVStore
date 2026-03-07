@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	kvpb "madkv/kvstore/gen/kvpb"
@@ -41,6 +43,7 @@ type kvServer struct {
 }
 
 const dbFileName = "commands.db"
+const requestIDMetadataKey = "x-request-id"
 
 func ownerForKey(key string, numServers int) int {
 	if numServers <= 1 {
@@ -89,6 +92,15 @@ func (s *kvServer) initDB() error {
 		CREATE TABLE IF NOT EXISTS wal_log (
 			seq INTEGER PRIMARY KEY AUTOINCREMENT,
 			payload BLOB NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS request_dedup (
+			request_id TEXT PRIMARY KEY,
+			op INTEGER NOT NULL,
+			key TEXT NOT NULL,
+			value TEXT NOT NULL,
+			found INTEGER NOT NULL,
+			old_value TEXT,
+			has_old_value INTEGER NOT NULL
 		);
 	`); err != nil {
 		return fmt.Errorf("initialize sqlite schema: %w", err)
@@ -143,6 +155,135 @@ func (s *kvServer) appendLog(cmd *kvpb.WALCommand) error {
 	return nil
 }
 
+func appendLogTx(tx *sql.Tx, cmd *kvpb.WALCommand) error {
+	if !isValidOp(cmd.Op) {
+		return fmt.Errorf("unknown wal op: %q", cmd.Op)
+	}
+	payload, err := proto.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("encode wal payload: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO wal_log(payload) VALUES(?)`, payload); err != nil {
+		return fmt.Errorf("append wal row: %w", err)
+	}
+	return nil
+}
+
+type cachedMutation struct {
+	op          kvpb.WALCommand_Op
+	key         string
+	value       string
+	found       bool
+	oldValue    string
+	hasOldValue bool
+}
+
+func boolAsInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func parseMutationRequestID(ctx context.Context) (string, bool, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return "", false, nil
+	}
+	values := md.Get(requestIDMetadataKey)
+	if len(values) == 0 {
+		return "", false, nil
+	}
+	if len(values) != 1 {
+		return "", false, status.Errorf(codes.InvalidArgument, "expected exactly one %q header", requestIDMetadataKey)
+	}
+	reqID := strings.TrimSpace(values[0])
+	if reqID == "" {
+		return "", false, status.Errorf(codes.InvalidArgument, "%q header cannot be empty", requestIDMetadataKey)
+	}
+	return reqID, true, nil
+}
+
+func (s *kvServer) lookupCachedMutation(reqID string) (*cachedMutation, error) {
+	row := s.db.QueryRow(`
+		SELECT op, key, value, found, old_value, has_old_value
+		FROM request_dedup
+		WHERE request_id = ?
+	`, reqID)
+	var op int64
+	var key, value string
+	var foundInt, hasOldValueInt int
+	var oldValue sql.NullString
+	if err := row.Scan(&op, &key, &value, &foundInt, &oldValue, &hasOldValueInt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read request dedup row: %w", err)
+	}
+	return &cachedMutation{
+		op:          kvpb.WALCommand_Op(op),
+		key:         key,
+		value:       value,
+		found:       foundInt != 0,
+		oldValue:    oldValue.String,
+		hasOldValue: hasOldValueInt != 0,
+	}, nil
+}
+
+func validateCachedMutation(cached *cachedMutation, cmd *kvpb.WALCommand) error {
+	if cached.op != cmd.Op || cached.key != cmd.Key || cached.value != cmd.Value {
+		return status.Errorf(codes.AlreadyExists, "request id reused with different operation")
+	}
+	return nil
+}
+
+func cacheMutationTx(tx *sql.Tx, reqID string, cached *cachedMutation) error {
+	var oldValue interface{}
+	if cached.hasOldValue {
+		oldValue = cached.oldValue
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO request_dedup(request_id, op, key, value, found, old_value, has_old_value)
+		VALUES(?, ?, ?, ?, ?, ?, ?)
+	`, reqID, int(cached.op), cached.key, cached.value, boolAsInt(cached.found), oldValue, boolAsInt(cached.hasOldValue)); err != nil {
+		return fmt.Errorf("insert request dedup row: %w", err)
+	}
+	return nil
+}
+
+func (s *kvServer) applyMutatingCommandWithDedup(cmd *kvpb.WALCommand, reqID string, found bool, oldValue string, hasOldValue bool) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin sqlite tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if err := appendLogTx(tx, cmd); err != nil {
+		return err
+	}
+	if err := cacheMutationTx(tx, reqID, &cachedMutation{
+		op:          cmd.Op,
+		key:         cmd.Key,
+		value:       cmd.Value,
+		found:       found,
+		oldValue:    oldValue,
+		hasOldValue: hasOldValue,
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sqlite tx: %w", err)
+	}
+	committed = true
+	s.applyCommand(cmd)
+	return nil
+}
+
 func (s *kvServer) applyCommand(cmd *kvpb.WALCommand) {
 	switch cmd.Op {
 	case kvpb.WALCommand_OP_PUT, kvpb.WALCommand_OP_SWAP:
@@ -166,8 +307,28 @@ func (s *kvServer) Put(ctx context.Context, req *kvpb.PutRequest) (*kvpb.PutRepl
 	if err := s.validateKeyOwner(req.Key); err != nil {
 		return nil, err
 	}
+	reqID, hasReqID, err := parseMutationRequestID(ctx)
+	if err != nil {
+		return nil, err
+	}
 	prev := s.tree.Get(item{key: req.Key})
 	cmd := &kvpb.WALCommand{Op: kvpb.WALCommand_OP_PUT, Key: req.Key, Value: req.Value}
+	if hasReqID {
+		cached, err := s.lookupCachedMutation(reqID)
+		if err != nil {
+			return nil, err
+		}
+		if cached != nil {
+			if err := validateCachedMutation(cached, cmd); err != nil {
+				return nil, err
+			}
+			return &kvpb.PutReply{Found: cached.found}, nil
+		}
+		if err := s.applyMutatingCommandWithDedup(cmd, reqID, prev != nil, "", false); err != nil {
+			return nil, err
+		}
+		return &kvpb.PutReply{Found: prev != nil}, nil
+	}
 	if err := s.appendLog(cmd); err != nil {
 		return nil, err
 	}
@@ -197,8 +358,40 @@ func (s *kvServer) Swap(ctx context.Context, req *kvpb.SwapRequest) (*kvpb.SwapR
 	if err := s.validateKeyOwner(req.Key); err != nil {
 		return nil, err
 	}
+	reqID, hasReqID, err := parseMutationRequestID(ctx)
+	if err != nil {
+		return nil, err
+	}
 	got := s.tree.Get(item{key: req.Key})
 	cmd := &kvpb.WALCommand{Op: kvpb.WALCommand_OP_SWAP, Key: req.Key, Value: req.Value}
+	if hasReqID {
+		cached, err := s.lookupCachedMutation(reqID)
+		if err != nil {
+			return nil, err
+		}
+		if cached != nil {
+			if err := validateCachedMutation(cached, cmd); err != nil {
+				return nil, err
+			}
+			if !cached.found {
+				return &kvpb.SwapReply{Found: false}, nil
+			}
+			return &kvpb.SwapReply{Found: true, OldValue: cached.oldValue}, nil
+		}
+		oldValue := ""
+		hasOldValue := false
+		if got != nil {
+			oldValue = got.(item).value
+			hasOldValue = true
+		}
+		if err := s.applyMutatingCommandWithDedup(cmd, reqID, got != nil, oldValue, hasOldValue); err != nil {
+			return nil, err
+		}
+		if got == nil {
+			return &kvpb.SwapReply{Found: false}, nil
+		}
+		return &kvpb.SwapReply{Found: true, OldValue: oldValue}, nil
+	}
 	if err := s.appendLog(cmd); err != nil {
 		return nil, err
 	}
@@ -217,8 +410,28 @@ func (s *kvServer) Delete(ctx context.Context, req *kvpb.DeleteRequest) (*kvpb.D
 	if err := s.validateKeyOwner(req.Key); err != nil {
 		return nil, err
 	}
+	reqID, hasReqID, err := parseMutationRequestID(ctx)
+	if err != nil {
+		return nil, err
+	}
 	del := s.tree.Get(item{key: req.Key})
 	cmd := &kvpb.WALCommand{Op: kvpb.WALCommand_OP_DELETE, Key: req.Key}
+	if hasReqID {
+		cached, err := s.lookupCachedMutation(reqID)
+		if err != nil {
+			return nil, err
+		}
+		if cached != nil {
+			if err := validateCachedMutation(cached, cmd); err != nil {
+				return nil, err
+			}
+			return &kvpb.DeleteReply{Found: cached.found}, nil
+		}
+		if err := s.applyMutatingCommandWithDedup(cmd, reqID, del != nil, "", false); err != nil {
+			return nil, err
+		}
+		return &kvpb.DeleteReply{Found: del != nil}, nil
+	}
 	if err := s.appendLog(cmd); err != nil {
 		return nil, err
 	}

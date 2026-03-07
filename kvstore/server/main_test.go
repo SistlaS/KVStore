@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	kvpb "madkv/kvstore/gen/kvpb"
@@ -188,5 +189,67 @@ func TestPartitionOwnershipEnforced(t *testing.T) {
 	st, ok := status.FromError(err)
 	if !ok || st.Code() != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition, got err=%v", err)
+	}
+}
+
+func TestPutDedupByRequestID(t *testing.T) {
+	srv, err := newKVServer(t.TempDir())
+	if err != nil {
+		t.Fatalf("newKVServer() failed: %v", err)
+	}
+	defer srv.db.Close()
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(requestIDMetadataKey, "req-put-1"))
+	first, err := srv.Put(ctx, &kvpb.PutRequest{Key: "k", Value: "v1"})
+	if err != nil {
+		t.Fatalf("first Put() failed: %v", err)
+	}
+	if first.Found {
+		t.Fatalf("first Put().Found = true, want false")
+	}
+
+	second, err := srv.Put(ctx, &kvpb.PutRequest{Key: "k", Value: "v1"})
+	if err != nil {
+		t.Fatalf("second Put() failed: %v", err)
+	}
+	if second.Found {
+		t.Fatalf("second Put().Found = true, want false due to dedup reply reuse")
+	}
+
+	var walRows int
+	if err := srv.db.QueryRow(`SELECT COUNT(*) FROM wal_log`).Scan(&walRows); err != nil {
+		t.Fatalf("count wal_log rows: %v", err)
+	}
+	if walRows != 1 {
+		t.Fatalf("wal_log row count = %d, want 1", walRows)
+	}
+}
+
+func TestSwapDedupByRequestID(t *testing.T) {
+	srv, err := newKVServer(t.TempDir())
+	if err != nil {
+		t.Fatalf("newKVServer() failed: %v", err)
+	}
+	defer srv.db.Close()
+
+	if _, err := srv.Put(context.Background(), &kvpb.PutRequest{Key: "k", Value: "v0"}); err != nil {
+		t.Fatalf("seed Put() failed: %v", err)
+	}
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(requestIDMetadataKey, "req-swap-1"))
+	first, err := srv.Swap(ctx, &kvpb.SwapRequest{Key: "k", Value: "v1"})
+	if err != nil {
+		t.Fatalf("first Swap() failed: %v", err)
+	}
+	if !first.Found || first.OldValue != "v0" {
+		t.Fatalf("first Swap() = %+v, want found=true old_value=v0", first)
+	}
+
+	second, err := srv.Swap(ctx, &kvpb.SwapRequest{Key: "k", Value: "v1"})
+	if err != nil {
+		t.Fatalf("second Swap() failed: %v", err)
+	}
+	if !second.Found || second.OldValue != "v0" {
+		t.Fatalf("second Swap() = %+v, want same reply as first", second)
 	}
 }
