@@ -1,0 +1,5 @@
+./kvstore.pb.go
+./kvstore_grpc.pb.go
+./manager.pb.go
+./manager_grpc.pb.go
+./wal.pb.go
