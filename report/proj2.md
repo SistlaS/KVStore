@@ -1,6 +1,6 @@
 # CS 739 MadKV Project 2
 
-**Group members**: Soumya Sistla `ssistla@wisc.edu`, Amith Bhat `email`
+**Group members**: Soumya Sistla `ssistla@wisc.edu`, Amith Bhat Nekkare `bhatnekkare@wisc.edu`
 
 ## Design Walkthrough
 
@@ -54,7 +54,13 @@ You will run the described testcase during demo time.
 
 ### Explanations
 
-*FIXME: add your explanation of this testcase*
+This testcase validates both partition isolation and crash recovery in a 3-server cluster. We launch the cluster with 3 partition servers and perform a series of Puts and Swaps across keys that hash to different partitions. We then verify correctness with Gets and Scans, all of which should return their latest written values.
+
+Next, we kill one server (server 1) to simulate a crash. We immediately verify that Gets and Scans targeting keys owned by the surviving partitions (servers 0 and 2) continue to succeed without interruption, demonstrating fault isolation. We then issue a Get or Scan for a key owned by the failed partition (server 1), which should time out since the server is unreachable.
+
+Finally, we restart server 1 with the same backer directory. The server replays its WAL on startup, reconstructing its in-memory state from persisted log entries. We then issue a Get for a key that was previously written to that partition — it should return the correct latest value, confirming that durability and recovery are working correctly.
+
+The test is automated - and can be run using `just p2::testcase`
 
 ## Fuzz Testing
 
