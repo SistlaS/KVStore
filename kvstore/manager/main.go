@@ -9,10 +9,11 @@ import (
 	"strings"
 	"sync"
 
+	kvpb "madkv/kvstore/gen/kvpb"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	kvpb "madkv/kvstore/gen/kvpb"
 )
 
 type managerServer struct {
