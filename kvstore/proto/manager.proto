@@ -8,13 +8,15 @@ service ClusterManager {
 }
 
 message RegisterServerRequest {
-  uint32 server_id = 1;
-  string api_addr = 2;
+  uint32 partition_id = 1;
+  uint32 replica_id = 2;
+  string api_addr = 3;
 }
 
 message RegisterServerReply {
-  uint32 num_servers = 1;
-  string assigned_api_addr = 2;
+  uint32 num_partitions = 1;
+  uint32 server_rf = 2;
+  string assigned_api_addr = 3;
 }
 
 message GetClusterInfoRequest {}
@@ -22,4 +24,6 @@ message GetClusterInfoRequest {}
 message GetClusterInfoReply {
   bool ready = 1;
   repeated string server_addrs = 2;
+  uint32 server_rf = 3;
+  uint32 num_partitions = 4;
 }

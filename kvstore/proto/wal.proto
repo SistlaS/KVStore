@@ -14,3 +14,14 @@ message WALCommand {
   string key = 2;
   string value = 3;
 }
+
+message ClientCommand {
+  WALCommand wal = 1;
+  string request_id = 2;
+}
+
+message RaftLogEntry {
+  uint64 index = 1;
+  uint64 term = 2;
+  ClientCommand command = 3;
+}

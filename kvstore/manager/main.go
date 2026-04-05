@@ -18,29 +18,58 @@ import (
 
 type managerServer struct {
 	kvpb.UnimplementedClusterManagerServer
-	mu          sync.Mutex
-	serverAddrs []string
-	registered  map[uint32]bool
+	mu            sync.Mutex
+	serverAddrs   []string
+	serverRF      int
+	numPartitions int
+	registered    map[uint32]bool
 }
 
-func newManagerServer(serverAddrs []string) *managerServer {
-	return &managerServer{
-		serverAddrs: serverAddrs,
-		registered:  make(map[uint32]bool, len(serverAddrs)),
+func newManagerServer(serverAddrs []string, serverRF int) (*managerServer, error) {
+	if serverRF <= 0 {
+		return nil, fmt.Errorf("server replication factor must be positive")
 	}
+	if len(serverAddrs) == 0 || len(serverAddrs)%serverRF != 0 {
+		return nil, fmt.Errorf("server address count %d must be a positive multiple of server_rf %d", len(serverAddrs), serverRF)
+	}
+	return &managerServer{
+		serverAddrs:   serverAddrs,
+		serverRF:      serverRF,
+		numPartitions: len(serverAddrs) / serverRF,
+		registered:    make(map[uint32]bool, len(serverAddrs)),
+	}, nil
+}
+
+func flattenServerID(partitionID, replicaID uint32, serverRF int) (uint32, error) {
+	if serverRF <= 0 {
+		return 0, fmt.Errorf("server replication factor must be positive")
+	}
+	return partitionID*uint32(serverRF) + replicaID, nil
 }
 
 func (m *managerServer) RegisterServer(ctx context.Context, req *kvpb.RegisterServerRequest) (*kvpb.RegisterServerReply, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if int(req.ServerId) >= len(m.serverAddrs) {
-		return nil, status.Errorf(codes.InvalidArgument, "server id %d out of range", req.ServerId)
+	if int(req.PartitionId) >= m.numPartitions {
+		return nil, status.Errorf(codes.InvalidArgument, "partition id %d out of range", req.PartitionId)
 	}
-	m.registered[req.ServerId] = true
+	if int(req.ReplicaId) >= m.serverRF {
+		return nil, status.Errorf(codes.InvalidArgument, "replica id %d out of range", req.ReplicaId)
+	}
+	serverID, err := flattenServerID(req.PartitionId, req.ReplicaId, m.serverRF)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid server indices: %v", err)
+	}
+	if int(serverID) >= len(m.serverAddrs) {
+		return nil, status.Errorf(codes.InvalidArgument, "server id %d out of range", serverID)
+	}
+	expected := m.serverAddrs[serverID]
+	m.registered[serverID] = true
 	return &kvpb.RegisterServerReply{
-		NumServers:      uint32(len(m.serverAddrs)),
-		AssignedApiAddr: m.serverAddrs[req.ServerId],
+		NumPartitions: uint32(m.numPartitions),
+		ServerRf:      uint32(m.serverRF),
+		AssignedApiAddr: expected,
 	}, nil
 }
 
@@ -50,7 +79,12 @@ func (m *managerServer) GetClusterInfo(ctx context.Context, req *kvpb.GetCluster
 
 	ready := len(m.registered) == len(m.serverAddrs)
 	addrs := append([]string(nil), m.serverAddrs...)
-	return &kvpb.GetClusterInfoReply{Ready: ready, ServerAddrs: addrs}, nil
+	return &kvpb.GetClusterInfoReply{
+		Ready:         ready,
+		ServerAddrs:   addrs,
+		ServerRf:      uint32(m.serverRF),
+		NumPartitions: uint32(m.numPartitions),
+	}, nil
 }
 
 func parseServers(raw string) ([]string, error) {
@@ -66,31 +100,40 @@ func parseServers(raw string) ([]string, error) {
 	if len(out) == 0 {
 		return nil, fmt.Errorf("servers list is empty")
 	}
-	if len(out) > 50 {
-		return nil, fmt.Errorf("too many servers (%d), max is 50", len(out))
+	if len(out) > 500 {
+		return nil, fmt.Errorf("too many servers (%d), max is 500", len(out))
 	}
 	return out, nil
 }
 
 func main() {
-	listenAddr := flag.String("listen", "0.0.0.0:3666", "ip:port for manager")
-	servers := flag.String("servers", "127.0.0.1:3777", "comma-separated list of server public addresses")
+	replicaID := flag.Int("replica_id", 0, "manager replica ID")
+	managerListen := flag.String("man_listen", "0.0.0.0:3666", "ip:port for manager client/server API")
+	_ = flag.String("p2p_listen", "0.0.0.0:3606", "unused manager peer listener for non-replicated manager mode")
+	_ = flag.String("peer_addrs", "none", "unused manager peers for non-replicated manager mode")
+	serverRF := flag.Int("server_rf", 1, "server replication factor")
+	servers := flag.String("server_addrs", "127.0.0.1:3777", "comma-separated list of server public addresses")
+	_ = flag.String("backer_path", "./backer.m.0", "unused manager backer path for non-replicated manager mode")
 	flag.Parse()
 
 	serverAddrs, err := parseServers(*servers)
 	if err != nil {
-		log.Fatalf("invalid servers arg: %v", err)
+		log.Fatalf("invalid server_addrs arg: %v", err)
+	}
+	mgr, err := newManagerServer(serverAddrs, *serverRF)
+	if err != nil {
+		log.Fatalf("manager init failed: %v", err)
 	}
 
-	lis, err := net.Listen("tcp", *listenAddr)
+	lis, err := net.Listen("tcp", *managerListen)
 	if err != nil {
 		log.Fatalf("listen failed: %v", err)
 	}
 
 	grpcServer := grpc.NewServer()
-	kvpb.RegisterClusterManagerServer(grpcServer, newManagerServer(serverAddrs))
+	kvpb.RegisterClusterManagerServer(grpcServer, mgr)
 
-	fmt.Printf("manager listening on %s with %d servers\n", *listenAddr, len(serverAddrs))
+	fmt.Printf("manager replica %d listening on %s with %d partitions rf=%d\n", *replicaID, *managerListen, mgr.numPartitions, mgr.serverRF)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("serve failed: %v", err)
 	}
