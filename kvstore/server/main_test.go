@@ -3,14 +3,35 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
 	"strconv"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	kvpb "madkv/kvstore/gen/kvpb"
 )
+
+type mockRaftPeerClient struct {
+	requestVoteFn func(context.Context, *kvpb.RequestVoteRequest, ...grpc.CallOption) (*kvpb.RequestVoteReply, error)
+	appendFn      func(context.Context, *kvpb.AppendEntriesRequest, ...grpc.CallOption) (*kvpb.AppendEntriesReply, error)
+}
+
+func (m *mockRaftPeerClient) RequestVote(ctx context.Context, req *kvpb.RequestVoteRequest, opts ...grpc.CallOption) (*kvpb.RequestVoteReply, error) {
+	return m.requestVoteFn(ctx, req, opts...)
+}
+
+func (m *mockRaftPeerClient) AppendEntries(ctx context.Context, req *kvpb.AppendEntriesRequest, opts ...grpc.CallOption) (*kvpb.AppendEntriesReply, error) {
+	if m.appendFn != nil {
+		return m.appendFn(ctx, req, opts...)
+	}
+	return &kvpb.AppendEntriesReply{Term: req.Term, Success: true, MatchIndex: req.PrevLogIndex + uint64(len(req.Entries))}, nil
+}
 
 func newTestServer(t *testing.T, backerDir string, partitionID, replicaID, serverRF, numPartitions int) *kvServer {
 	t.Helper()
@@ -212,5 +233,86 @@ func TestPartitionOwnershipEnforced(t *testing.T) {
 	st, ok := status.FromError(err)
 	if !ok || st.Code() != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition, got %v", err)
+	}
+}
+
+func TestCandidateRestartsElectionWhenVoteRPCsHang(t *testing.T) {
+	log.SetOutput(os.Stderr)
+	srv := newTestServer(t, t.TempDir(), 0, 0, 3, 1)
+	srv.mu.Lock()
+	srv.peerClients[1] = &mockRaftPeerClient{
+		requestVoteFn: func(ctx context.Context, req *kvpb.RequestVoteRequest, opts ...grpc.CallOption) (*kvpb.RequestVoteReply, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	srv.peerClients[2] = &mockRaftPeerClient{
+		requestVoteFn: func(ctx context.Context, req *kvpb.RequestVoteRequest, opts ...grpc.CallOption) (*kvpb.RequestVoteReply, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	srv.electionDeadline = time.Now().Add(-time.Second)
+	srv.mu.Unlock()
+
+	srv.startElection()
+	time.Sleep(25 * time.Millisecond)
+	srv.mu.Lock()
+	firstTerm := srv.currentTerm
+	srv.electionDeadline = time.Now().Add(-time.Second)
+	srv.mu.Unlock()
+
+	srv.startElection()
+	time.Sleep(25 * time.Millisecond)
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if firstTerm != 1 {
+		t.Fatalf("first term = %d, want 1", firstTerm)
+	}
+	if srv.currentTerm != 2 {
+		t.Fatalf("currentTerm = %d, want 2 after restarting election", srv.currentTerm)
+	}
+	if srv.role != roleCandidate {
+		t.Fatalf("role = %s, want candidate", srv.role)
+	}
+}
+
+func TestElectionStabilizesWhenMajorityReplies(t *testing.T) {
+	srv := newTestServer(t, t.TempDir(), 0, 0, 3, 1)
+	var appendCount atomic.Int32
+	srv.mu.Lock()
+	srv.peerClients[1] = &mockRaftPeerClient{
+		requestVoteFn: func(ctx context.Context, req *kvpb.RequestVoteRequest, opts ...grpc.CallOption) (*kvpb.RequestVoteReply, error) {
+			return &kvpb.RequestVoteReply{Term: req.Term, VoteGranted: true}, nil
+		},
+		appendFn: func(ctx context.Context, req *kvpb.AppendEntriesRequest, opts ...grpc.CallOption) (*kvpb.AppendEntriesReply, error) {
+			appendCount.Add(1)
+			return &kvpb.AppendEntriesReply{Term: req.Term, Success: true, MatchIndex: req.PrevLogIndex + uint64(len(req.Entries))}, nil
+		},
+	}
+	srv.peerClients[2] = &mockRaftPeerClient{
+		requestVoteFn: func(ctx context.Context, req *kvpb.RequestVoteRequest, opts ...grpc.CallOption) (*kvpb.RequestVoteReply, error) {
+			time.Sleep(300 * time.Millisecond)
+			return &kvpb.RequestVoteReply{Term: req.Term, VoteGranted: false}, nil
+		},
+		appendFn: func(ctx context.Context, req *kvpb.AppendEntriesRequest, opts ...grpc.CallOption) (*kvpb.AppendEntriesReply, error) {
+			appendCount.Add(1)
+			return &kvpb.AppendEntriesReply{Term: req.Term, Success: true, MatchIndex: req.PrevLogIndex + uint64(len(req.Entries))}, nil
+		},
+	}
+	srv.electionDeadline = time.Now().Add(-time.Second)
+	srv.mu.Unlock()
+
+	srv.startElection()
+	time.Sleep(100 * time.Millisecond)
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.role != roleLeader {
+		t.Fatalf("role = %s, want leader", srv.role)
+	}
+	if appendCount.Load() == 0 {
+		t.Fatalf("expected immediate heartbeat broadcast after majority")
 	}
 }

@@ -97,6 +97,11 @@ type kvServer struct {
 	waiters map[uint64][]chan applyResult
 }
 
+func (s *kvServer) logf(format string, args ...interface{}) {
+	prefix := fmt.Sprintf("[raft p=%d r=%d role=%s term=%d] ", s.partitionID, s.replicaID, s.role, s.currentTerm)
+	log.Printf(prefix+format, args...)
+}
+
 func ownerForKey(key string, numPartitions int) int {
 	if numPartitions <= 1 {
 		return 0
@@ -182,6 +187,7 @@ func newKVServer(backerDir string, partitionID, replicaID, serverRF, numPartitio
 	}
 	s.resetElectionDeadlineLocked()
 	s.lastContact = time.Now()
+	s.logf("initialized api=%s peers=%v", s.apiAddr, s.peerP2PAddrs)
 	return s, nil
 }
 
@@ -361,6 +367,8 @@ func (s *kvServer) resetElectionDeadlineLocked() {
 }
 
 func (s *kvServer) becomeFollowerLocked(term uint64, leaderID int, leaderAddr string) error {
+	prevRole := s.role
+	prevTerm := s.currentTerm
 	if term > s.currentTerm {
 		s.currentTerm = term
 		s.votedFor = -1
@@ -376,6 +384,7 @@ func (s *kvServer) becomeFollowerLocked(term uint64, leaderID int, leaderAddr st
 	s.leaderAddr = leaderAddr
 	s.lastContact = time.Now()
 	s.resetElectionDeadlineLocked()
+	s.logf("became follower from role=%s prev_term=%d leader=%d leader_addr=%s", prevRole, prevTerm, leaderID, leaderAddr)
 	return nil
 }
 
@@ -687,6 +696,7 @@ func (s *kvServer) RequestVote(ctx context.Context, req *kvpb.RequestVoteRequest
 	defer s.mu.Unlock()
 
 	if req.Term < s.currentTerm {
+		s.logf("deny vote to candidate=%d stale_term=%d", req.CandidateId, req.Term)
 		return &kvpb.RequestVoteReply{Term: s.currentTerm, VoteGranted: false}, nil
 	}
 	if req.Term > s.currentTerm {
@@ -704,8 +714,10 @@ func (s *kvServer) RequestVote(ctx context.Context, req *kvpb.RequestVoteRequest
 		}
 		s.lastContact = time.Now()
 		s.resetElectionDeadlineLocked()
+		s.logf("grant vote to candidate=%d", req.CandidateId)
 		return &kvpb.RequestVoteReply{Term: s.currentTerm, VoteGranted: true}, nil
 	}
+	s.logf("deny vote to candidate=%d up_to_date=%v voted_for=%d", req.CandidateId, upToDate, s.votedFor)
 	return &kvpb.RequestVoteReply{Term: s.currentTerm, VoteGranted: false}, nil
 }
 
@@ -714,6 +726,7 @@ func (s *kvServer) AppendEntries(ctx context.Context, req *kvpb.AppendEntriesReq
 	defer s.mu.Unlock()
 
 	if req.Term < s.currentTerm {
+		s.logf("reject append from leader=%d stale_term=%d", req.LeaderId, req.Term)
 		return &kvpb.AppendEntriesReply{Term: s.currentTerm, Success: false, MatchIndex: s.lastLogIndexLocked()}, nil
 	}
 	if req.Term > s.currentTerm || s.role != roleFollower {
@@ -728,6 +741,7 @@ func (s *kvServer) AppendEntries(ctx context.Context, req *kvpb.AppendEntriesReq
 	}
 
 	if req.PrevLogIndex > s.lastLogIndexLocked() || s.logTermLocked(req.PrevLogIndex) != req.PrevLogTerm {
+		s.logf("reject append from leader=%d prev=(%d,%d) local_last=(%d,%d)", req.LeaderId, req.PrevLogIndex, req.PrevLogTerm, s.lastLogIndexLocked(), s.lastLogTermLocked())
 		return &kvpb.AppendEntriesReply{Term: s.currentTerm, Success: false, MatchIndex: s.lastLogIndexLocked()}, nil
 	}
 
@@ -760,6 +774,9 @@ func (s *kvServer) AppendEntries(ctx context.Context, req *kvpb.AppendEntriesReq
 			return nil, err
 		}
 	}
+	if len(req.Entries) == 0 {
+		s.logf("accepted heartbeat from leader=%d commit=%d", req.LeaderId, req.LeaderCommit)
+	}
 	return &kvpb.AppendEntriesReply{Term: s.currentTerm, Success: true, MatchIndex: s.lastLogIndexLocked()}, nil
 }
 
@@ -769,6 +786,7 @@ func (s *kvServer) startElection() {
 		s.mu.Unlock()
 		return
 	}
+	prevRole := s.role
 	s.role = roleCandidate
 	s.currentTerm++
 	s.votedFor = s.replicaID
@@ -788,6 +806,7 @@ func (s *kvServer) startElection() {
 		return
 	}
 	s.resetElectionDeadlineLocked()
+	s.logf("starting election from_role=%s last_log=(%d,%d)", prevRole, lastIndex, lastTerm)
 	s.mu.Unlock()
 
 	votes := 1
@@ -797,6 +816,9 @@ func (s *kvServer) startElection() {
 		go func(peerID int) {
 			client, err := s.getPeerClient(peerID)
 			if err != nil {
+				s.mu.Lock()
+				s.logf("vote request peer=%d dial failed: %v", peerID, err)
+				s.mu.Unlock()
 				return
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
@@ -809,6 +831,7 @@ func (s *kvServer) startElection() {
 			})
 			if err != nil {
 				s.mu.Lock()
+				s.logf("vote request peer=%d failed: %v", peerID, err)
 				s.resetPeerClient(peerID)
 				s.mu.Unlock()
 				return
@@ -834,12 +857,15 @@ func (s *kvServer) startElection() {
 					shouldBroadcast = true
 				}
 				voteMu.Unlock()
+				s.logf("received vote from peer=%d votes=%d majority=%v", peerID, votes, shouldLead)
 				if shouldLead && s.role == roleCandidate && s.currentTerm == term {
 					s.becomeLeaderLocked()
 					if shouldBroadcast {
 						go s.broadcastAppendEntries()
 					}
 				}
+			} else {
+				s.logf("vote denied by peer=%d resp_term=%d", peerID, resp.Term)
 			}
 		}(peerID)
 	}
@@ -883,6 +909,9 @@ func (s *kvServer) replicateToPeer(peerID int) {
 
 	client, err := s.getPeerClient(peerID)
 	if err != nil {
+		s.mu.Lock()
+		s.logf("append peer=%d dial failed: %v", peerID, err)
+		s.mu.Unlock()
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
@@ -890,6 +919,7 @@ func (s *kvServer) replicateToPeer(peerID int) {
 	resp, err := client.AppendEntries(ctx, req)
 	if err != nil {
 		s.mu.Lock()
+		s.logf("append peer=%d failed: %v", peerID, err)
 		s.resetPeerClient(peerID)
 		s.mu.Unlock()
 		return
@@ -909,11 +939,17 @@ func (s *kvServer) replicateToPeer(peerID int) {
 	if resp.Success {
 		s.matchIndex[peerID] = resp.MatchIndex
 		s.nextIndex[peerID] = resp.MatchIndex + 1
+		if len(req.Entries) == 0 {
+			s.logf("heartbeat ack peer=%d match=%d", peerID, resp.MatchIndex)
+		} else {
+			s.logf("append ack peer=%d match=%d entries=%d", peerID, resp.MatchIndex, len(req.Entries))
+		}
 		if err := s.maybeAdvanceCommitLocked(); err != nil {
 			log.Printf("advance commit failed: %v", err)
 		}
 		return
 	}
+	s.logf("append rejected by peer=%d resp_term=%d match=%d", peerID, resp.Term, resp.MatchIndex)
 	if resp.MatchIndex+1 < s.nextIndex[peerID] {
 		s.nextIndex[peerID] = resp.MatchIndex + 1
 	} else if s.nextIndex[peerID] > 1 {
