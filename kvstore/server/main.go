@@ -356,7 +356,7 @@ func (s *kvServer) logTermLocked(index uint64) uint64 {
 }
 
 func (s *kvServer) resetElectionDeadlineLocked() {
-	timeout := time.Duration(800+s.rng.Intn(600)) * time.Millisecond
+	timeout := time.Duration(2000+s.rng.Intn(2000)) * time.Millisecond
 	s.electionDeadline = time.Now().Add(timeout)
 }
 
@@ -791,12 +791,10 @@ func (s *kvServer) startElection() {
 	s.mu.Unlock()
 
 	votes := 1
-	var wg sync.WaitGroup
 	var voteMu sync.Mutex
+	announcedLeader := false
 	for _, peerID := range s.peerReplicaIDs {
-		wg.Add(1)
 		go func(peerID int) {
-			defer wg.Done()
 			client, err := s.getPeerClient(peerID)
 			if err != nil {
 				return
@@ -827,18 +825,24 @@ func (s *kvServer) startElection() {
 				return
 			}
 			if resp.VoteGranted {
+				shouldBroadcast := false
 				voteMu.Lock()
 				votes++
 				shouldLead := votes > s.serverRF/2
+				if shouldLead && !announcedLeader {
+					announcedLeader = true
+					shouldBroadcast = true
+				}
 				voteMu.Unlock()
 				if shouldLead && s.role == roleCandidate && s.currentTerm == term {
 					s.becomeLeaderLocked()
+					if shouldBroadcast {
+						go s.broadcastAppendEntries()
+					}
 				}
 			}
 		}(peerID)
 	}
-	wg.Wait()
-	s.broadcastAppendEntries()
 }
 
 func (s *kvServer) getPeerClient(replicaID int) (kvpb.RaftPeerClient, error) {
