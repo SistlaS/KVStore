@@ -171,6 +171,7 @@ kill:
 
 python_run := if `which uv || true` != "" { "uv run" } else { "python3" }
 tmpdir_prefix := "/tmp/madkv-p3"
+cargo_home := if `pwd` != "" { "`pwd`/.cargo-home" } else { ".cargo-home" }
 
 # launch the KV service components on node (see README for conventions)
 service node="s0.0" \
@@ -182,7 +183,8 @@ service node="s0.0" \
         backer_prefix="./backer":
     just p3::build
     just utils::build
-    cargo run -p runner -r --bin service -- \
+    mkdir -p "{{cargo_home}}"
+    CARGO_HOME="{{cargo_home}}" cargo run -p runner -r --bin service -- \
         --server-just-args p3::server \
             $({{python_run}} justmod/xtract.py partid "{{node}}") \
             $({{python_run}} justmod/xtract.py repid "{{node}}") \
@@ -208,9 +210,27 @@ tmpdir subdir:
 # run a fuzz testing scenario
 fuzz server_rf="5" crashing="no" \
      managers="127.0.0.1:3666,127.0.0.1:3667,127.0.0.1:3668": (tmpdir "fuzz")
+    #!/usr/bin/env bash
+    set -euo pipefail
     just p3::build
     just utils::build
-    cargo run -p runner -r --bin fuzzer -- \
+    reachable=0
+    IFS=',' read -r -a addrs <<< "{{managers}}"
+    for addr in "${addrs[@]}"; do
+        host="${addr%:*}"
+        port="${addr##*:}"
+        if nc -z "$host" "$port" >/dev/null 2>&1; then
+            reachable=1
+            break
+        fi
+    done
+    if [ "$reachable" -eq 0 ]; then
+        echo "no manager replicas are reachable at {{managers}}" >&2
+        echo "start the cluster first with 'just p3::service ...' (or launch manager/server recipes manually), then rerun fuzz" >&2
+        exit 1
+    fi
+    mkdir -p "{{cargo_home}}"
+    CARGO_HOME="{{cargo_home}}" cargo run -p runner -r --bin fuzzer -- \
         --num-clis 5 \
         --conflict \
         --client-just-args p3::client "{{managers}}" \
@@ -220,10 +240,28 @@ fuzz server_rf="5" crashing="no" \
 # run a YCSB benchmark workload
 bench nclis wload server_rf="3" \
       managers="127.0.0.1:3666,127.0.0.1:3667,127.0.0.1:3668": (tmpdir "bench")
+    #!/usr/bin/env bash
+    set -euo pipefail
     just p3::build
     just utils::build
     just utils::ycsb
-    cargo run -p runner -r --bin bencher -- \
+    reachable=0
+    IFS=',' read -r -a addrs <<< "{{managers}}"
+    for addr in "${addrs[@]}"; do
+        host="${addr%:*}"
+        port="${addr##*:}"
+        if nc -z "$host" "$port" >/dev/null 2>&1; then
+            reachable=1
+            break
+        fi
+    done
+    if [ "$reachable" -eq 0 ]; then
+        echo "no manager replicas are reachable at {{managers}}" >&2
+        echo "start the cluster first with 'just p3::service ...' (or launch manager/server recipes manually), then rerun bench" >&2
+        exit 1
+    fi
+    mkdir -p "{{cargo_home}}"
+    CARGO_HOME="{{cargo_home}}" cargo run -p runner -r --bin bencher -- \
         --num-clis "{{nclis}}" \
         --workload "{{wload}}" \
         --client-just-args p3::client "{{managers}}" \
