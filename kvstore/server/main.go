@@ -282,18 +282,7 @@ func (s *kvServer) loadPersistentState() error {
 	if s.commitIndex > s.lastLogIndexLocked() {
 		s.commitIndex = s.lastLogIndexLocked()
 	}
-	for s.lastApplied < s.commitIndex {
-		s.lastApplied++
-		entry := s.logEntries[s.lastApplied-1]
-		cached, err := s.applyEntryLocked(entry)
-		if err != nil {
-			return err
-		}
-		if entry.Command != nil && entry.Command.RequestId != "" {
-			s.dedup[entry.Command.RequestId] = cached
-		}
-	}
-	return nil
+	return s.rebuildStateFromCommittedLocked()
 }
 
 func (s *kvServer) persistMetaLocked(key, value string) error {
@@ -319,6 +308,7 @@ func (s *kvServer) deleteLogSuffixLocked(fromIndex uint64) error {
 	if fromIndex == 0 {
 		return nil
 	}
+	needRebuild := fromIndex <= s.lastApplied
 	if _, err := s.db.Exec(`DELETE FROM raft_log WHERE log_index >= ?`, fromIndex); err != nil {
 		return fmt.Errorf("delete log suffix from %d: %w", fromIndex, err)
 	}
@@ -333,6 +323,9 @@ func (s *kvServer) deleteLogSuffixLocked(fromIndex uint64) error {
 	}
 	if s.lastApplied > s.commitIndex {
 		s.lastApplied = s.commitIndex
+	}
+	if needRebuild {
+		return s.rebuildStateFromCommittedLocked()
 	}
 	return nil
 }
@@ -401,6 +394,11 @@ func (s *kvServer) becomeLeaderLocked() {
 	s.nextIndex[s.replicaID] = s.lastLogIndexLocked() + 1
 	s.resetElectionDeadlineLocked()
 	log.Printf("partition %d replica %d became leader for term %d", s.partitionID, s.replicaID, s.currentTerm)
+	if _, _, err := s.appendLocalEntryLocked(&kvpb.ClientCommand{
+		Wal: &kvpb.WALCommand{Op: kvpb.WALCommand_OP_UNSPECIFIED},
+	}, false); err != nil {
+		s.logf("failed to append leader no-op: %v", err)
+	}
 }
 
 func (s *kvServer) ensurePeerClient(replicaID int) (kvpb.RaftPeerClient, error) {
@@ -528,6 +526,24 @@ func (s *kvServer) applyCommittedEntriesLocked() error {
 	return nil
 }
 
+func (s *kvServer) rebuildStateFromCommittedLocked() error {
+	s.tree = btree.New(8)
+	s.dedup = make(map[string]cachedMutation)
+	s.lastApplied = 0
+	for s.lastApplied < s.commitIndex {
+		s.lastApplied++
+		entry := s.logEntries[s.lastApplied-1]
+		cached, err := s.applyEntryLocked(entry)
+		if err != nil {
+			return err
+		}
+		if entry.Command != nil && entry.Command.RequestId != "" {
+			s.dedup[entry.Command.RequestId] = cached
+		}
+	}
+	return nil
+}
+
 func (s *kvServer) maybeAdvanceCommitLocked() error {
 	lastIdx := s.lastLogIndexLocked()
 	for idx := lastIdx; idx > s.commitIndex; idx-- {
@@ -551,6 +567,38 @@ func (s *kvServer) maybeAdvanceCommitLocked() error {
 	return nil
 }
 
+func (s *kvServer) appendLocalEntryLocked(command *kvpb.ClientCommand, registerWaiter bool) (uint64, <-chan applyResult, error) {
+	entry := &kvpb.RaftLogEntry{
+		Index:   s.lastLogIndexLocked() + 1,
+		Term:    s.currentTerm,
+		Command: command,
+	}
+	if err := s.persistLogEntryLocked(entry); err != nil {
+		return 0, nil, err
+	}
+	s.logEntries = append(s.logEntries, entry)
+	s.matchIndex[s.replicaID] = entry.Index
+	s.nextIndex[s.replicaID] = entry.Index + 1
+	var waitCh chan applyResult
+	if registerWaiter {
+		waitCh = make(chan applyResult, 1)
+		s.waiters[entry.Index] = append(s.waiters[entry.Index], waitCh)
+	}
+	if err := s.maybeAdvanceCommitLocked(); err != nil {
+		return 0, nil, err
+	}
+	return entry.Index, waitCh, nil
+}
+
+func (s *kvServer) leaderReadyForReadsLocked() bool {
+	for idx := s.commitIndex; idx > 0; idx-- {
+		if s.logTermLocked(idx) == s.currentTerm {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *kvServer) submitCommand(ctx context.Context, command *kvpb.ClientCommand) (cachedMutation, error) {
 	s.mu.Lock()
 	if s.role != roleLeader {
@@ -572,22 +620,8 @@ func (s *kvServer) submitCommand(ctx context.Context, command *kvpb.ClientComman
 			return cached, nil
 		}
 	}
-
-	entry := &kvpb.RaftLogEntry{
-		Index:   s.lastLogIndexLocked() + 1,
-		Term:    s.currentTerm,
-		Command: command,
-	}
-	if err := s.persistLogEntryLocked(entry); err != nil {
-		s.mu.Unlock()
-		return cachedMutation{}, err
-	}
-	s.logEntries = append(s.logEntries, entry)
-	s.matchIndex[s.replicaID] = entry.Index
-	s.nextIndex[s.replicaID] = entry.Index + 1
-	waitCh := make(chan applyResult, 1)
-	s.waiters[entry.Index] = append(s.waiters[entry.Index], waitCh)
-	if err := s.maybeAdvanceCommitLocked(); err != nil {
+	_, waitCh, err := s.appendLocalEntryLocked(command, true)
+	if err != nil {
 		s.mu.Unlock()
 		return cachedMutation{}, err
 	}
@@ -615,6 +649,9 @@ func (s *kvServer) Get(ctx context.Context, req *kvpb.GetRequest) (*kvpb.GetRepl
 	}
 	if s.role != roleLeader {
 		return nil, notLeaderError(s.leaderAddr)
+	}
+	if !s.leaderReadyForReadsLocked() {
+		return nil, status.Error(codes.Unavailable, "leader not ready for reads")
 	}
 	got := s.tree.Get(item{key: req.Key})
 	if got == nil {
@@ -678,6 +715,9 @@ func (s *kvServer) Scan(ctx context.Context, req *kvpb.ScanRequest) (*kvpb.ScanR
 
 	if s.role != roleLeader {
 		return nil, notLeaderError(s.leaderAddr)
+	}
+	if !s.leaderReadyForReadsLocked() {
+		return nil, status.Error(codes.Unavailable, "leader not ready for reads")
 	}
 	pairs := make([]*kvpb.KVPair, 0)
 	s.tree.AscendGreaterOrEqual(item{key: req.StartKey}, func(i btree.Item) bool {

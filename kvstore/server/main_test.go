@@ -93,8 +93,8 @@ func TestSingleReplicaLeaderCommitsAndReplays(t *testing.T) {
 	}
 
 	srv.mu.Lock()
-	if srv.commitIndex != 1 || srv.lastApplied != 1 {
-		t.Fatalf("commitIndex=%d lastApplied=%d, want 1/1", srv.commitIndex, srv.lastApplied)
+	if srv.commitIndex != 2 || srv.lastApplied != 2 {
+		t.Fatalf("commitIndex=%d lastApplied=%d, want 2/2", srv.commitIndex, srv.lastApplied)
 	}
 	srv.mu.Unlock()
 
@@ -138,6 +138,26 @@ func TestFollowerRejectsClientRequestsWithLeaderHint(t *testing.T) {
 	}
 	if st.Message() != "not leader: 127.0.0.1:3779" {
 		t.Fatalf("unexpected redirect message: %q", st.Message())
+	}
+}
+
+func TestLeaderRejectsReadsUntilCurrentTermEntryCommitted(t *testing.T) {
+	srv := newTestServer(t, t.TempDir(), 0, 0, 3, 1)
+	srv.mu.Lock()
+	srv.role = roleLeader
+	srv.currentTerm = 4
+	srv.leaderAddr = srv.apiAddr
+	srv.commitIndex = 0
+	srv.lastApplied = 0
+	srv.mu.Unlock()
+
+	_, err := srv.Get(context.Background(), &kvpb.GetRequest{Key: "alpha"})
+	if err == nil {
+		t.Fatalf("Get() unexpectedly succeeded")
+	}
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.Unavailable {
+		t.Fatalf("expected Unavailable, got %v", err)
 	}
 }
 
@@ -212,6 +232,47 @@ func TestAppendEntriesAppliesCommittedCommand(t *testing.T) {
 	got := srv.tree.Get(item{key: "beta"})
 	if got == nil || got.(item).value != "two" {
 		t.Fatalf("applied tree value = %v, want beta=two", got)
+	}
+}
+
+func TestDeleteLogSuffixRebuildsAppliedState(t *testing.T) {
+	srv := newTestServer(t, t.TempDir(), 0, 1, 3, 1)
+
+	_, err := srv.AppendEntries(context.Background(), &kvpb.AppendEntriesRequest{
+		Term:          4,
+		LeaderId:      0,
+		PrevLogIndex:  0,
+		PrevLogTerm:   0,
+		LeaderCommit:  1,
+		LeaderApiAddr: "127.0.0.1:3777",
+		Entries: []*kvpb.RaftLogEntry{
+			{
+				Index: 1,
+				Term:  4,
+				Command: &kvpb.ClientCommand{
+					RequestId: "req-trunc",
+					Wal:       &kvpb.WALCommand{Op: kvpb.WALCommand_OP_PUT, Key: "ghost", Value: "value"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AppendEntries() failed: %v", err)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if got := srv.tree.Get(item{key: "ghost"}); got == nil {
+		t.Fatalf("expected ghost key before truncation")
+	}
+	if err := srv.deleteLogSuffixLocked(1); err != nil {
+		t.Fatalf("deleteLogSuffixLocked() failed: %v", err)
+	}
+	if got := srv.tree.Get(item{key: "ghost"}); got != nil {
+		t.Fatalf("ghost key remained after truncation: %v", got)
+	}
+	if srv.commitIndex != 0 || srv.lastApplied != 0 {
+		t.Fatalf("commitIndex=%d lastApplied=%d, want 0/0", srv.commitIndex, srv.lastApplied)
 	}
 }
 

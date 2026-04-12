@@ -42,7 +42,9 @@ clean:
     rm -rf kvstore/bin
     rm -rf kvstore/gen
     rm -rf kvstore/.gocache
-    rm -rf tmp/madkv-p3
+    rm -rf /tmp/madkv-p3
+    rm -f /tmp/madkv-p3-*.log
+    rm -f /tmp/madkv-p3-*.pid
     @echo "*******Cleaned build artifacts*******"
 
 # run tests for your KV code
