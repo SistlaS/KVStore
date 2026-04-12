@@ -5,6 +5,7 @@ ROOT="${ROOT:-$(pwd)}"
 MANAGER="127.0.0.1:3666"
 SERVER_ADDRS="127.0.0.1:3777,127.0.0.1:3778,127.0.0.1:3779,127.0.0.1:3780,127.0.0.1:3781"
 P2P_ADDRS="127.0.0.1:3707,127.0.0.1:3708,127.0.0.1:3709,127.0.0.1:3710,127.0.0.1:3711"
+FUZZ_YES_LOG="/tmp/madkv-p3/fuzz/fuzz-5-yes.log"
 
 leader_replica_from_logs() {
   local leader
@@ -42,6 +43,21 @@ kill_first_alive_excluding() {
       return 0
     fi
   done
+  return 1
+}
+
+wait_for_fuzz_start_local() {
+  local timeout_sec="${FUZZ_START_TIMEOUT_SEC:-180}"
+  local waited=0
+  while [[ "$waited" -lt "$timeout_sec" ]]; do
+    if [[ -f "$FUZZ_YES_LOG" ]] && grep -q "Fuzzing starts" "$FUZZ_YES_LOG"; then
+      echo "[fuzz-yes] detected fuzzer start in log"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "[fuzz-yes] warning: timed out waiting for fuzzer start log (${timeout_sec}s); skipping crash injection"
   return 1
 }
 
@@ -158,6 +174,7 @@ fuzz_yes() {
   local killer_pid=""
 
   (
+    wait_for_fuzz_start_local || exit 0
     sleep "$crash_delay"
     local first=""
     first="$(leader_replica_from_logs || true)"
