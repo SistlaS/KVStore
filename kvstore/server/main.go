@@ -174,8 +174,8 @@ func newKVServer(backerDir string, partitionID, replicaID, serverRF, numPartitio
 		votedFor:       -1,
 		nextIndex:      make(map[int]uint64, serverRF),
 		matchIndex:     make(map[int]uint64, serverRF),
-		dedup:   make(map[string]cachedMutation),
-		waiters: make(map[uint64][]chan applyResult),
+		dedup:          make(map[string]cachedMutation),
+		waiters:        make(map[uint64][]chan applyResult),
 	}
 	if err := s.initDB(); err != nil {
 		_ = db.Close()
@@ -194,7 +194,7 @@ func newKVServer(backerDir string, partitionID, replicaID, serverRF, numPartitio
 func (s *kvServer) initDB() error {
 	if _, err := s.db.Exec(`
 		PRAGMA journal_mode = WAL;
-		PRAGMA synchronous = NORMAL;
+		PRAGMA synchronous = FULL;
 		CREATE TABLE IF NOT EXISTS raft_meta (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -821,7 +821,7 @@ func (s *kvServer) startElection() {
 				s.mu.Unlock()
 				return
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
 			defer cancel()
 			resp, err := client.RequestVote(ctx, &kvpb.RequestVoteRequest{
 				Term:         term,
@@ -914,7 +914,7 @@ func (s *kvServer) replicateToPeer(peerID int) {
 		s.mu.Unlock()
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
 	defer cancel()
 	resp, err := client.AppendEntries(ctx, req)
 	if err != nil {
