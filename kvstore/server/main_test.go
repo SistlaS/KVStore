@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -375,5 +376,158 @@ func TestElectionStabilizesWhenMajorityReplies(t *testing.T) {
 	}
 	if appendCount.Load() == 0 {
 		t.Fatalf("expected immediate heartbeat broadcast after majority")
+	}
+}
+
+func TestFailingSomeServerFollowerReplicas(t *testing.T) {
+	srv := newTestServer(t, t.TempDir(), 0, 0, 3, 1)
+	becomeTestLeader(t, srv, 7)
+
+	srv.mu.Lock()
+	srv.peerClients[1] = &mockRaftPeerClient{
+		appendFn: func(ctx context.Context, req *kvpb.AppendEntriesRequest, opts ...grpc.CallOption) (*kvpb.AppendEntriesReply, error) {
+			return &kvpb.AppendEntriesReply{Term: req.Term, Success: true, MatchIndex: req.PrevLogIndex + uint64(len(req.Entries))}, nil
+		},
+	}
+	srv.peerClients[2] = &mockRaftPeerClient{
+		appendFn: func(ctx context.Context, req *kvpb.AppendEntriesRequest, opts ...grpc.CallOption) (*kvpb.AppendEntriesReply, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	srv.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := srv.submitCommand(ctx, &kvpb.ClientCommand{
+		RequestId: "req-follower-failure",
+		Wal:       &kvpb.WALCommand{Op: kvpb.WALCommand_OP_PUT, Key: "follower-down", Value: "ok"},
+	})
+	if err != nil {
+		t.Fatalf("submitCommand() failed: %v", err)
+	}
+	if got.found {
+		t.Fatalf("submitCommand().found = true, want false")
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if got := srv.tree.Get(item{key: "follower-down"}); got == nil {
+		t.Fatalf("expected committed value despite one failed follower")
+	}
+}
+
+func TestFailingServerLeaderReplicaTriggersElection(t *testing.T) {
+	srv := newTestServer(t, t.TempDir(), 0, 1, 3, 1)
+	srv.mu.Lock()
+	srv.role = roleFollower
+	srv.currentTerm = 0
+	srv.electionDeadline = time.Now().Add(-time.Second)
+	srv.peerClients[0] = &mockRaftPeerClient{
+		requestVoteFn: func(ctx context.Context, req *kvpb.RequestVoteRequest, opts ...grpc.CallOption) (*kvpb.RequestVoteReply, error) {
+			return &kvpb.RequestVoteReply{Term: req.Term, VoteGranted: true}, nil
+		},
+		appendFn: func(ctx context.Context, req *kvpb.AppendEntriesRequest, opts ...grpc.CallOption) (*kvpb.AppendEntriesReply, error) {
+			return &kvpb.AppendEntriesReply{Term: req.Term, Success: true, MatchIndex: req.PrevLogIndex + uint64(len(req.Entries))}, nil
+		},
+	}
+	srv.peerClients[2] = &mockRaftPeerClient{
+		requestVoteFn: func(ctx context.Context, req *kvpb.RequestVoteRequest, opts ...grpc.CallOption) (*kvpb.RequestVoteReply, error) {
+			return &kvpb.RequestVoteReply{Term: req.Term, VoteGranted: false}, nil
+		},
+		appendFn: func(ctx context.Context, req *kvpb.AppendEntriesRequest, opts ...grpc.CallOption) (*kvpb.AppendEntriesReply, error) {
+			return &kvpb.AppendEntriesReply{Term: req.Term, Success: true, MatchIndex: req.PrevLogIndex + uint64(len(req.Entries))}, nil
+		},
+	}
+	srv.mu.Unlock()
+
+	srv.startElection()
+	time.Sleep(120 * time.Millisecond)
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.role != roleLeader {
+		t.Fatalf("role = %s, want leader after election", srv.role)
+	}
+	if srv.currentTerm != 1 {
+		t.Fatalf("currentTerm = %d, want 1", srv.currentTerm)
+	}
+}
+
+func TestFailingBeyondAvailabilityThreshold(t *testing.T) {
+	srv := newTestServer(t, t.TempDir(), 0, 0, 5, 1)
+	becomeTestLeader(t, srv, 9)
+
+	srv.mu.Lock()
+	srv.peerClients[1] = &mockRaftPeerClient{
+		appendFn: func(ctx context.Context, req *kvpb.AppendEntriesRequest, opts ...grpc.CallOption) (*kvpb.AppendEntriesReply, error) {
+			return &kvpb.AppendEntriesReply{Term: req.Term, Success: true, MatchIndex: req.PrevLogIndex + uint64(len(req.Entries))}, nil
+		},
+	}
+	for _, peerID := range []int{2, 3, 4} {
+		srv.peerClients[peerID] = &mockRaftPeerClient{
+			appendFn: func(ctx context.Context, req *kvpb.AppendEntriesRequest, opts ...grpc.CallOption) (*kvpb.AppendEntriesReply, error) {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			},
+		}
+	}
+	srv.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 220*time.Millisecond)
+	defer cancel()
+	_, err := srv.submitCommand(ctx, &kvpb.ClientCommand{
+		RequestId: "req-beyond-threshold",
+		Wal:       &kvpb.WALCommand{Op: kvpb.WALCommand_OP_PUT, Key: "no-quorum", Value: "x"},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("submitCommand() err = %v, want context deadline exceeded", err)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if got := srv.tree.Get(item{key: "no-quorum"}); got != nil {
+		t.Fatalf("key unexpectedly applied without quorum: %v", got)
+	}
+}
+
+func TestFailingManagerReplicaStillSupportsRegistration(t *testing.T) {
+	managerAddrs := []string{"m0:3666", "m1:3667", "m2:3668"}
+	callCount := map[string]int{}
+	registerFn := func(ctx context.Context, managerAddr string, req *kvpb.RegisterServerRequest) (*kvpb.RegisterServerReply, error) {
+		callCount[managerAddr]++
+		if managerAddr == "m0:3666" {
+			return nil, status.Error(codes.Unavailable, "manager replica down")
+		}
+		return &kvpb.RegisterServerReply{
+			NumPartitions: 1,
+			ServerRf:      3,
+			AssignedApiAddr: "127.0.0.1:3778",
+		}, nil
+	}
+
+	sleepCalls := 0
+	sleepFn := func(time.Duration) { sleepCalls++ }
+	numPartitions, serverRF, assigned, err := registerWithManagersWithFuncs(
+		managerAddrs,
+		0,
+		1,
+		"127.0.0.1:3778",
+		200*time.Millisecond,
+		time.Millisecond,
+		registerFn,
+		sleepFn,
+	)
+	if err != nil {
+		t.Fatalf("registerWithManagersWithFuncs() failed: %v", err)
+	}
+	if numPartitions != 1 || serverRF != 3 || assigned != "127.0.0.1:3778" {
+		t.Fatalf("unexpected registration result: partitions=%d rf=%d assigned=%s", numPartitions, serverRF, assigned)
+	}
+	if callCount["m0:3666"] == 0 || callCount["m1:3667"] == 0 || callCount["m2:3668"] == 0 {
+		t.Fatalf("expected registration attempts to all managers, got calls=%v", callCount)
+	}
+	if sleepCalls != 0 {
+		t.Fatalf("unexpected retries: sleepCalls=%d", sleepCalls)
 	}
 }

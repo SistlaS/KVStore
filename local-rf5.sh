@@ -165,10 +165,20 @@ restart() {
 }
 
 fuzz_no() {
+  clean
+  up
+  set +e
   just p3::fuzz 5 no "$MANAGER"
+  local fuzz_rc=$?
+  set -e
+  down
+  return "$fuzz_rc"
 }
 
 fuzz_yes() {
+  clean
+  up
+
   local crash_delay="${CRASH_DELAY_SEC:-8}"
   local crash_gap="${CRASH_GAP_SEC:-3}"
   local killer_pid=""
@@ -198,6 +208,7 @@ fuzz_yes() {
 
   kill "$killer_pid" >/dev/null 2>&1 || true
   wait "$killer_pid" >/dev/null 2>&1 || true
+  down
   return "$fuzz_rc"
 }
 

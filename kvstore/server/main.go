@@ -1035,29 +1035,67 @@ func (s *kvServer) heartbeatLoop(ctx context.Context) {
 }
 
 func registerWithManagers(managerAddrs []string, partitionID, replicaID int, apiAddr string, timeout, retryInterval time.Duration) (int, int, string, error) {
+	registerFn := func(ctx context.Context, managerAddr string, req *kvpb.RegisterServerRequest) (*kvpb.RegisterServerReply, error) {
+		conn, err := grpc.NewClient(managerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+		c := kvpb.NewClusterManagerClient(conn)
+		return c.RegisterServer(ctx, req)
+	}
+	sleepFn := func(d time.Duration) {
+		time.Sleep(d)
+	}
+	return registerWithManagersWithFuncs(managerAddrs, partitionID, replicaID, apiAddr, timeout, retryInterval, registerFn, sleepFn)
+}
+
+func registerWithManagersWithFuncs(
+	managerAddrs []string,
+	partitionID, replicaID int,
+	apiAddr string,
+	timeout, retryInterval time.Duration,
+	registerFn func(context.Context, string, *kvpb.RegisterServerRequest) (*kvpb.RegisterServerReply, error),
+	sleepFn func(time.Duration),
+) (int, int, string, error) {
+	if len(managerAddrs) == 0 {
+		return 0, 0, "", fmt.Errorf("no manager addresses provided")
+	}
+	requiredAcks := len(managerAddrs)/2 + 1
+	req := &kvpb.RegisterServerRequest{
+		PartitionId: uint32(partitionID),
+		ReplicaId:   uint32(replicaID),
+		ApiAddr:     apiAddr,
+	}
+
 	for {
+		successes := 0
+		var accepted *kvpb.RegisterServerReply
 		for _, managerAddr := range managerAddrs {
-			conn, err := grpc.NewClient(managerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
-				log.Printf("manager dial failed (%s): %v", managerAddr, err)
-				continue
-			}
-			c := kvpb.NewClusterManagerClient(conn)
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			resp, err := c.RegisterServer(ctx, &kvpb.RegisterServerRequest{
-				PartitionId: uint32(partitionID),
-				ReplicaId:   uint32(replicaID),
-				ApiAddr:     apiAddr,
-			})
+			resp, err := registerFn(ctx, managerAddr, req)
 			cancel()
-			_ = conn.Close()
 			if err != nil {
 				log.Printf("manager register failed (%s): %v", managerAddr, err)
 				continue
 			}
-			return int(resp.NumPartitions), int(resp.ServerRf), resp.AssignedApiAddr, nil
+			if accepted == nil {
+				cloned := *resp
+				accepted = &cloned
+				successes++
+				continue
+			}
+			if resp.NumPartitions != accepted.NumPartitions || resp.ServerRf != accepted.ServerRf || resp.AssignedApiAddr != accepted.AssignedApiAddr {
+				log.Printf("manager register returned inconsistent topology (%s): got partitions=%d rf=%d assigned=%s, expected partitions=%d rf=%d assigned=%s",
+					managerAddr, resp.NumPartitions, resp.ServerRf, resp.AssignedApiAddr, accepted.NumPartitions, accepted.ServerRf, accepted.AssignedApiAddr)
+				continue
+			}
+			successes++
 		}
-		time.Sleep(retryInterval)
+		if accepted != nil && successes >= requiredAcks {
+			return int(accepted.NumPartitions), int(accepted.ServerRf), accepted.AssignedApiAddr, nil
+		}
+		sleepFn(retryInterval)
 	}
 }
 
