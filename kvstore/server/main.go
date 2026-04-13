@@ -41,6 +41,7 @@ const (
 	roleFollower         = "follower"
 	roleCandidate        = "candidate"
 	roleLeader           = "leader"
+	leaderLeaseInterval  = 750 * time.Millisecond
 )
 
 type cachedMutation struct {
@@ -89,9 +90,11 @@ type kvServer struct {
 
 	nextIndex  map[int]uint64
 	matchIndex map[int]uint64
+	recentAcks map[int]time.Time
 
 	lastContact      time.Time
 	electionDeadline time.Time
+	leaderLeaseUntil time.Time
 
 	dedup   map[string]cachedMutation
 	waiters map[uint64][]chan applyResult
@@ -169,6 +172,7 @@ func newKVServer(backerDir string, partitionID, replicaID, serverRF, numPartitio
 		votedFor:       -1,
 		nextIndex:      make(map[int]uint64, serverRF),
 		matchIndex:     make(map[int]uint64, serverRF),
+		recentAcks:     make(map[int]time.Time, serverRF),
 		dedup:          make(map[string]cachedMutation),
 		waiters:        make(map[uint64][]chan applyResult),
 	}
@@ -383,6 +387,8 @@ func (s *kvServer) becomeLeaderLocked() {
 	s.role = roleLeader
 	s.leaderID = s.replicaID
 	s.leaderAddr = s.apiAddr
+	s.leaderLeaseUntil = time.Time{}
+	clear(s.recentAcks)
 	next := s.lastLogIndexLocked() + 1
 	for id := 0; id < s.serverRF; id++ {
 		s.nextIndex[id] = next
@@ -392,6 +398,34 @@ func (s *kvServer) becomeLeaderLocked() {
 	s.nextIndex[s.replicaID] = s.lastLogIndexLocked() + 1
 	s.resetElectionDeadlineLocked()
 	log.Printf("partition %d replica %d became leader for term %d", s.partitionID, s.replicaID, s.currentTerm)
+}
+
+func (s *kvServer) renewLeaderLeaseLocked() {
+	s.leaderLeaseUntil = time.Now().Add(leaderLeaseInterval)
+}
+
+func (s *kvServer) hasLeaderLeaseLocked() bool {
+	if s.serverRF <= 1 {
+		return true
+	}
+	return time.Now().Before(s.leaderLeaseUntil)
+}
+
+func (s *kvServer) maybeRenewLeaderLeaseLocked() {
+	if s.serverRF <= 1 {
+		s.renewLeaderLeaseLocked()
+		return
+	}
+	cutoff := time.Now().Add(-leaderLeaseInterval)
+	acks := 1
+	for _, peerID := range s.peerReplicaIDs {
+		if ts, ok := s.recentAcks[peerID]; ok && !ts.Before(cutoff) {
+			acks++
+		}
+	}
+	if acks > s.serverRF/2 {
+		s.renewLeaderLeaseLocked()
+	}
 }
 
 func (s *kvServer) ensurePeerClient(replicaID int) (kvpb.RaftPeerClient, error) {
@@ -607,6 +641,9 @@ func (s *kvServer) Get(ctx context.Context, req *kvpb.GetRequest) (*kvpb.GetRepl
 	if s.role != roleLeader {
 		return nil, notLeaderError(s.leaderAddr)
 	}
+	if !s.hasLeaderLeaseLocked() {
+		return nil, notLeaderError("")
+	}
 	got := s.tree.Get(item{key: req.Key})
 	if got == nil {
 		return &kvpb.GetReply{Found: false}, nil
@@ -669,6 +706,9 @@ func (s *kvServer) Scan(ctx context.Context, req *kvpb.ScanRequest) (*kvpb.ScanR
 
 	if s.role != roleLeader {
 		return nil, notLeaderError(s.leaderAddr)
+	}
+	if !s.hasLeaderLeaseLocked() {
+		return nil, notLeaderError("")
 	}
 	pairs := make([]*kvpb.KVPair, 0)
 	s.tree.AscendGreaterOrEqual(item{key: req.StartKey}, func(i btree.Item) bool {
@@ -909,6 +949,8 @@ func (s *kvServer) replicateToPeer(peerID int) {
 	if resp.Success {
 		s.matchIndex[peerID] = resp.MatchIndex
 		s.nextIndex[peerID] = resp.MatchIndex + 1
+		s.recentAcks[peerID] = time.Now()
+		s.maybeRenewLeaderLeaseLocked()
 		if err := s.maybeAdvanceCommitLocked(); err != nil {
 			log.Printf("advance commit failed: %v", err)
 		}

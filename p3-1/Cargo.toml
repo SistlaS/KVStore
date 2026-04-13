@@ -1,0 +1,12 @@
+[workspace]
+members = ["refcli", "runner", "kvstore", "kvserver", "kvclient", "kvtester", "kvmanager", "raft"]
+resolver = "2"
+
+[workspace.dependencies]
+rand = "0.9"
+tonic = "0.8"             # gRPC framework
+prost = "0.11"            # Protocol buffer encoding/decoding
+tokio = { version = "1", features = ["full"] }  # Async runtime for gRPC
+tonic-build = "0.8"       # Used to compile `.proto` files
+log = "0.4"
+env_logger = "0.10"

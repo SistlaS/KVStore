@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package log;
+
+enum OperationType {
+    PUT = 0;
+    DELETE = 1;
+}
+
+message LogEntry {
+    OperationType op_type = 1;
+    string key = 2;
+    string value = 3; // Only present for PUT operations
+}

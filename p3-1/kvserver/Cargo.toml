@@ -1,0 +1,19 @@
+[package]
+name = "kvserver"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+kvstore = { path = "../kvstore" }
+raft = { path = "../raft" }
+
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+bloomfilter = "3"
+chrono = "0.4.40"
+
+[build-dependencies]
+tonic-build = { workspace = true }

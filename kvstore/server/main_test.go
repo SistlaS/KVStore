@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -117,6 +118,37 @@ func TestFollowerRejectsClientRequestsWithLeaderHint(t *testing.T) {
 	}
 	if st.Message() != "not leader: 127.0.0.1:3779" {
 		t.Fatalf("unexpected redirect message: %q", st.Message())
+	}
+}
+
+func TestLeaderReadRequiresFreshQuorumLease(t *testing.T) {
+	srv := newTestServer(t, t.TempDir(), 0, 0, 3, 1)
+	becomeTestLeader(t, srv, 2)
+
+	srv.mu.Lock()
+	_ = srv.tree.ReplaceOrInsert(item{key: "alpha", value: "one"})
+	srv.leaderLeaseUntil = time.Now().Add(-time.Second)
+	srv.mu.Unlock()
+
+	_, err := srv.Get(context.Background(), &kvpb.GetRequest{Key: "alpha"})
+	if err == nil {
+		t.Fatalf("Get() on stale leader unexpectedly succeeded")
+	}
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got %v", err)
+	}
+
+	srv.mu.Lock()
+	srv.renewLeaderLeaseLocked()
+	srv.mu.Unlock()
+
+	resp, err := srv.Get(context.Background(), &kvpb.GetRequest{Key: "alpha"})
+	if err != nil {
+		t.Fatalf("Get() with fresh lease failed: %v", err)
+	}
+	if !resp.Found || resp.Value != "one" {
+		t.Fatalf("Get() = %+v, want found=true value=one", resp)
 	}
 }
 
