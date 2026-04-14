@@ -1002,6 +1002,8 @@ func (s *kvServer) heartbeatLoop(ctx context.Context) {
 
 func registerWithManagers(managerAddrs []string, partitionID, replicaID int, apiAddr string, timeout, retryInterval time.Duration) (int, int, string, error) {
 	for {
+		var firstResp *kvpb.RegisterServerReply
+		registeredAny := false
 		for _, managerAddr := range managerAddrs {
 			conn, err := grpc.NewClient(managerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
@@ -1021,7 +1023,13 @@ func registerWithManagers(managerAddrs []string, partitionID, replicaID int, api
 				log.Printf("manager register failed (%s): %v", managerAddr, err)
 				continue
 			}
-			return int(resp.NumPartitions), int(resp.ServerRf), resp.AssignedApiAddr, nil
+			registeredAny = true
+			if firstResp == nil {
+				firstResp = resp
+			}
+		}
+		if registeredAny && firstResp != nil {
+			return int(firstResp.NumPartitions), int(firstResp.ServerRf), firstResp.AssignedApiAddr, nil
 		}
 		time.Sleep(retryInterval)
 	}
