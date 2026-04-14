@@ -85,7 +85,7 @@ d. For manager-failure testing (supported at routing level), we simulate one man
 
 These tests can be run by running the following command from the project root folder:
 
-go test ./kvstore/server -count=1 -v -run "TestFailingSomeServerFollowerReplicas|TestFailingServerLeaderReplicaTriggersElection|TestFailingBeyondAvailabilityThreshold|TestFailingManagerReplicaStillSupportsRegistration"
+cd kvstore/ just p3 deps && go test ./server -run TestReplicatedClusterFailureScenarios -count=1 -v
 
 All tests pass successfully and demonstrate the functionality working as expected.
 
@@ -122,9 +122,18 @@ We repeated the fuzz test while intentionally crashing replicas during execution
 
 ### Comments
 
-The YCSB runs show the expected tradeoff between replication and performance. Workloads with more writes, especially `a` and `b`, tended to run slower than the read-heavy workloads because every update has to be propagated through the replicated path and acknowledged by the leader.
+The plots currently reflect the benchmark runs we successfully completed for the `1 rf` and `3 rf` configurations. The `5 rf` runs are not shown because we were not able to collect stable complete logs for them, so the report generator skipped those cases instead of fabricating data.
 
-Throughput also scaled with client count up to the point where the cluster became saturated, after which added clients mainly increased contention rather than useful work. As replication factor increased, aggregate throughput dropped somewhat, which is consistent with the extra coordination and replication overhead, but the system still remained responsive across all workloads.
+Across the 10-client workload sweep, workload `c` has by far the highest throughput. This is expected because `c` is read-only, so requests avoid the replicated write path and do not pay the full cost of log replication, commit, and durable update. In contrast, workloads such as `a`, `b`, `d`, `e`, and especially `f` include writes or read-modify-write behavior, so they incur consensus overhead and therefore achieve much lower throughput.
+
+The latency plots are consistent with the throughput plot. Workload `c` has the lowest average and tail latency because it is dominated by reads. Workloads `a` and `f` have the highest average and p99 latencies because they are write-heavy and repeatedly exercise the leader, replication, and commit path. Workload `f` in particular is expensive because each operation depends on both reading existing state and then issuing an update.
+
+Comparing `1 rf` and `3 rf`, the general trend is that replication tends to increase the cost of update-heavy workloads. That is the expected tradeoff: `3 rf` improves fault tolerance, but every committed mutation now has to reach a majority of replicas before the leader can respond. For mostly read-oriented workloads, the gap is much smaller because once leadership is stable, reads are served directly by the leader and do not replicate new log entries.
+
+The throughput trend for YCSB-A scales upward from 1 client to 10 clients in the data we collected. This suggests the implementation is able to use additional concurrency effectively at low to moderate load, rather than saturating immediately with a single client. We only have partial scaling data for this plot, so the graph should be interpreted as an observed trend for the completed runs rather than a full saturation study.
+
+Overall, the benchmark results match the design of the system: read-only workloads perform best, write-heavy workloads pay for replication and durability, and increasing replication improves availability at the cost of higher write latency and lower update throughput.
+
 
 ## Additional Discussion
 
