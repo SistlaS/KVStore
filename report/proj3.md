@@ -102,10 +102,12 @@ You may be asked to run a crashing fuzz test during demo time.
 
 ### Comments
 
-Replicated servers, no crashing
+Replicated servers, no crashing:
+
 We ran the replicated cluster without injecting failures to verify that normal operation remained correct under concurrent client activity. In this configuration, the system preserved consistency and continued serving reads and writes successfully across all replicas, showing that replication and leader forwarding worked as expected.
 
-Replicated servers, with crashing
+Replicated servers, with crashing:
+
 We repeated the fuzz test while intentionally crashing replicas during execution to evaluate fault tolerance and recovery behavior. Even with failures, the cluster continued making progress after leader changes and replica restarts, which demonstrated that the replicated design could tolerate node loss and preserve availability for clients.
 
 ## YCSB Benchmarking

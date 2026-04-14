@@ -5,8 +5,9 @@ ROOT="${ROOT:-$(pwd)}"
 MANAGER="127.0.0.1:3666"
 SERVER_ADDRS=("127.0.0.1:3777" "127.0.0.1:3778" "127.0.0.1:3779" "127.0.0.1:3780" "127.0.0.1:3781")
 P2P_ADDRS=("127.0.0.1:3707" "127.0.0.1:3708" "127.0.0.1:3709" "127.0.0.1:3710" "127.0.0.1:3711")
-WORKDIR="tmp/madkv-p3-ycsb"
-BENCH_ROOT="tmp/madkv-p3/bench"
+WORKDIR="$ROOT/tmp/madkv-p3-ycsb"
+LOG_DIR="$ROOT/tmp/madkv-p3/ycsb"
+BENCH_ROOT="$ROOT/tmp/madkv-p3/bench"
 
 join_by() {
   local sep="$1"
@@ -45,8 +46,7 @@ peers_for_replica() {
 }
 
 clean_paths() {
-  rm -f tmp/madkv-p3-manager.pid tmp/madkv-p3-s{0,1,2,3,4}.pid
-  rm -f tmp/madkv-p3-manager.log tmp/madkv-p3-s{0,1,2,3,4}.log
+  rm -f "$LOG_DIR"/madkv-p3-manager.pid "$LOG_DIR"/madkv-p3-s{0,1,2,3,4}.pid
   rm -rf "$WORKDIR"
 }
 
@@ -67,7 +67,7 @@ wait_for_port() {
 
 stop_cluster() {
   local pid_file pid
-  for pid_file in tmp/madkv-p3-manager.pid tmp/madkv-p3-s{0,1,2,3,4}.pid; do
+  for pid_file in "$LOG_DIR"/madkv-p3-manager.pid "$LOG_DIR"/madkv-p3-s{0,1,2,3,4}.pid; do
     if [[ -f "$pid_file" ]]; then
       pid="$(cat "$pid_file")"
       if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
@@ -91,6 +91,7 @@ start_cluster() {
   server_addrs="$(server_addrs_for_rf "$rf")"
 
   mkdir -p "$WORKDIR"
+  mkdir -p "$LOG_DIR"
   cd kvstore
 
   ./bin/manager \
@@ -101,12 +102,12 @@ start_cluster() {
     --server_rf "$rf" \
     --server_addrs "$server_addrs" \
     --backer_path "./backer.m.${tag}" \
-    >"tmp/madkv-p3-manager.log" 2>&1 &
-  echo $! >tmp/madkv-p3-manager.pid
+    >"$LOG_DIR/madkv-p3-manager.log" 2>&1 &
+  echo $! >"$LOG_DIR/madkv-p3-manager.pid"
 
   if ! wait_for_port 127.0.0.1 3666 30; then
     echo "manager did not become reachable on ${MANAGER}" >&2
-    tail -n 50 tmp/madkv-p3-manager.log >&2 || true
+    tail -n 50 "$LOG_DIR/madkv-p3-manager.log" >&2 || true
     return 1
   fi
 
@@ -124,8 +125,8 @@ start_cluster() {
       --p2p_listen "$p2p_addr" \
       --peer_addrs "$peers" \
       --backer_path "./backer.s0.${rid}.${tag}" \
-    >"tmp/madkv-p3-s${rid}.log" 2>&1 &
-    echo $! >tmp/madkv-p3-s${rid}.pid
+    >"$LOG_DIR/madkv-p3-s${rid}.log" 2>&1 &
+    echo $! >"$LOG_DIR/madkv-p3-s${rid}.pid"
   done
 
   cd "$ROOT"
@@ -137,7 +138,7 @@ start_cluster() {
     if ! wait_for_port "$host" "$port" 30; then
       echo "server did not become reachable on ${api_addr}" >&2
       for rid in $(seq 0 $((rf - 1))); do
-        tail -n 50 "tmp/madkv-p3-s${rid}.log" >&2 || true
+        tail -n 50 "$LOG_DIR/madkv-p3-s${rid}.log" >&2 || true
       done
       return 1
     fi
@@ -200,7 +201,6 @@ main() {
     all)
       just p3::build
       just utils::build
-      just utils::ycsb
       stop_cluster
       bench_matrix_10_clients
       bench_scale_a
@@ -209,7 +209,6 @@ main() {
     matrix)
       just p3::build
       just utils::build
-      just utils::ycsb
       stop_cluster
       bench_matrix_10_clients
       stop_cluster
@@ -217,7 +216,6 @@ main() {
     scale-a)
       just p3::build
       just utils::build
-      just utils::ycsb
       stop_cluster
       bench_scale_a
       stop_cluster
