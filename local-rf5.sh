@@ -5,11 +5,12 @@ ROOT="${ROOT:-$(pwd)}"
 MANAGER="127.0.0.1:3666"
 SERVER_ADDRS="127.0.0.1:3777,127.0.0.1:3778,127.0.0.1:3779,127.0.0.1:3780,127.0.0.1:3781"
 P2P_ADDRS="127.0.0.1:3707,127.0.0.1:3708,127.0.0.1:3709,127.0.0.1:3710,127.0.0.1:3711"
-FUZZ_YES_LOG="tmp/madkv-p3/fuzz/fuzz-5-yes.log"
+LOG_DIR="$ROOT/tmp/madkv-p3/fuzz"
+FUZZ_YES_LOG="$LOG_DIR/fuzz-5-yes.log"
 
 leader_replica_from_logs() {
   local leader
-  leader="$(grep -h 'became leader' tmp/madkv-p3-s*.log 2>/dev/null | tail -n 1 | sed -E 's/.*replica ([0-9]+) became leader.*/\1/')"
+  leader="$(grep -h 'became leader' "$LOG_DIR"/madkv-p3-s*.log 2>/dev/null | tail -n 1 | sed -E 's/.*replica ([0-9]+) became leader.*/\1/')"
   if [[ "$leader" =~ ^[0-4]$ ]]; then
     echo "$leader"
   fi
@@ -17,7 +18,7 @@ leader_replica_from_logs() {
 
 kill_replica_by_id() {
   local rid="$1"
-  local pid_file="tmp/madkv-p3-s${rid}.pid"
+  local pid_file="$LOG_DIR/madkv-p3-s${rid}.pid"
   if [[ ! -f "$pid_file" ]]; then
     return 1
   fi
@@ -64,6 +65,8 @@ wait_for_fuzz_start_local() {
 up() {
   just p3::build
 
+  mkdir -p "$LOG_DIR"
+
   cd kvstore
 
   ./bin/manager \
@@ -74,8 +77,8 @@ up() {
     --server_rf 5 \
     --server_addrs "$SERVER_ADDRS" \
     --backer_path ./backer.m.0 \
-    > tmp/madkv-p3-manager.log 2>&1 &
-  echo $! > tmp/madkv-p3-manager.pid
+    > "$LOG_DIR/madkv-p3-manager.log" 2>&1 &
+  echo $! > "$LOG_DIR/madkv-p3-manager.pid"
 
   ./bin/server \
     --partition_id 0 --replica_id 0 \
@@ -84,8 +87,8 @@ up() {
     --p2p_listen 127.0.0.1:3707 \
     --peer_addrs "127.0.0.1:3708,127.0.0.1:3709,127.0.0.1:3710,127.0.0.1:3711" \
     --backer_path ./backer.s0.0 \
-    > tmp/madkv-p3-s0.log 2>&1 &
-  echo $! > tmp/madkv-p3-s0.pid
+    > "$LOG_DIR/madkv-p3-s0.log" 2>&1 &
+  echo $! > "$LOG_DIR/madkv-p3-s0.pid"
 
   ./bin/server \
     --partition_id 0 --replica_id 1 \
@@ -94,8 +97,8 @@ up() {
     --p2p_listen 127.0.0.1:3708 \
     --peer_addrs "127.0.0.1:3707,127.0.0.1:3709,127.0.0.1:3710,127.0.0.1:3711" \
     --backer_path ./backer.s0.1 \
-    > tmp/madkv-p3-s1.log 2>&1 &
-  echo $! > tmp/madkv-p3-s1.pid
+    > "$LOG_DIR/madkv-p3-s1.log" 2>&1 &
+  echo $! > "$LOG_DIR/madkv-p3-s1.pid"
 
   ./bin/server \
     --partition_id 0 --replica_id 2 \
@@ -104,8 +107,8 @@ up() {
     --p2p_listen 127.0.0.1:3709 \
     --peer_addrs "127.0.0.1:3707,127.0.0.1:3708,127.0.0.1:3710,127.0.0.1:3711" \
     --backer_path ./backer.s0.2 \
-    > tmp/madkv-p3-s2.log 2>&1 &
-  echo $! > tmp/madkv-p3-s2.pid
+    > "$LOG_DIR/madkv-p3-s2.log" 2>&1 &
+  echo $! > "$LOG_DIR/madkv-p3-s2.pid"
 
   ./bin/server \
     --partition_id 0 --replica_id 3 \
@@ -114,8 +117,8 @@ up() {
     --p2p_listen 127.0.0.1:3710 \
     --peer_addrs "127.0.0.1:3707,127.0.0.1:3708,127.0.0.1:3709,127.0.0.1:3711" \
     --backer_path ./backer.s0.3 \
-    > tmp/madkv-p3-s3.log 2>&1 &
-  echo $! > tmp/madkv-p3-s3.pid
+    > "$LOG_DIR/madkv-p3-s3.log" 2>&1 &
+  echo $! > "$LOG_DIR/madkv-p3-s3.pid"
 
   ./bin/server \
     --partition_id 0 --replica_id 4 \
@@ -124,8 +127,8 @@ up() {
     --p2p_listen 127.0.0.1:3711 \
     --peer_addrs "127.0.0.1:3707,127.0.0.1:3708,127.0.0.1:3709,127.0.0.1:3710" \
     --backer_path ./backer.s0.4 \
-    > tmp/madkv-p3-s4.log 2>&1 &
-  echo $! > tmp/madkv-p3-s4.pid
+    > "$LOG_DIR/madkv-p3-s4.log" 2>&1 &
+  echo $! > "$LOG_DIR/madkv-p3-s4.pid"
 
   cd "$ROOT"
   sleep 5
@@ -136,12 +139,12 @@ down() {
   just p3::kill || true
 
   for f in \
-    tmp/madkv-p3-manager.pid \
-    tmp/madkv-p3-s0.pid \
-    tmp/madkv-p3-s1.pid \
-    tmp/madkv-p3-s2.pid \
-    tmp/madkv-p3-s3.pid \
-    tmp/madkv-p3-s4.pid
+    "$LOG_DIR/madkv-p3-manager.pid" \
+    "$LOG_DIR/madkv-p3-s0.pid" \
+    "$LOG_DIR/madkv-p3-s1.pid" \
+    "$LOG_DIR/madkv-p3-s2.pid" \
+    "$LOG_DIR/madkv-p3-s3.pid" \
+    "$LOG_DIR/madkv-p3-s4.pid"
   do
     if [[ -f "$f" ]]; then
       kill "$(cat "$f")" >/dev/null 2>&1 || true
@@ -153,9 +156,6 @@ down() {
 clean() {
   down
   rm -rf kvstore/backer.*
-  rm -f /tmp/madkv-p3-manager.log
-  rm -f tmp/madkv-p3-s0.log tmp/madkv-p3-s1.log tmp/madkv-p3-s2.log
-  rm -f tmp/madkv-p3-s3.log tmp/madkv-p3-s4.log
 }
 
 restart() {
