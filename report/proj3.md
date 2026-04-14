@@ -85,7 +85,7 @@ d. For manager-failure testing (supported at routing level), we simulate one man
 
 These tests can be run by running the following command from the project root folder:
 
-cd kvstore/ just p3 deps && go test ./server -run TestReplicatedClusterFailureScenarios -count=1 -v
+cd kvstore/ && just p3 deps && go test ./server -run TestReplicatedClusterFailureScenarios -count=1 -v
 
 All tests pass successfully and demonstrate the functionality working as expected.
 
